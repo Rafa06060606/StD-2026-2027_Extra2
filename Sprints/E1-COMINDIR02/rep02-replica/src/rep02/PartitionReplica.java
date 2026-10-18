@@ -3,6 +3,7 @@ package rep02;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.util.Random;
 import java.util.TreeMap;
 
 public class PartitionReplica {
@@ -16,186 +17,189 @@ public class PartitionReplica {
     private final TreeMap<Long, SensorRecord> buffered = new TreeMap<>();
     private boolean recovering = false;
 
+    // Simulação de perdas (-Dperda=p e -Ddescartar=seq)
+    private final double perdaProb;
+    private Long descartarSeq;
+    private final Random rand = new Random();
+
     public PartitionReplica(String replicaId, int k, String api) throws Exception {
         this.replicaId = replicaId;
         this.k = k;
-        
+
         this.file = new RecordFile("replica-" + replicaId + "-p" + k + ".txt");
         this.seq = file.lastSeq();
 
+        double p = 0.0;
+        String propPerda = System.getProperty("perda");
+        if (propPerda != null) {
+            try { p = Double.parseDouble(propPerda); } catch (NumberFormatException ignored) {}
+        }
+        this.perdaProb = p;
+
+        Long dSeq = null;
+        String propDesc = System.getProperty("descartar");
+        if (propDesc != null) {
+            try { dSeq = Long.parseLong(propDesc); } catch (NumberFormatException ignored) {}
+        }
+        this.descartarSeq = dSeq;
+
         IpfsPubSub pubsub = new IpfsPubSub(api);
 
-        System.out.println("Réplica " + replicaId + " (p" + k + ") iniciada. Último seq local: " + seq);
-
-        new Thread(this::initialRecovery).start();
+        System.out.println("Réplica " + replicaId + " subscreve " + Wire.topicData(k) + " (lastSeq() = " + seq + ")");
 
         pubsub.subscribe(Wire.topicData(k), msg -> {
             try {
                 String trimmed = msg != null ? msg.trim() : "";
-                if (!trimmed.startsWith("REG")) {
-                    System.out.println("REJEITADO; Mensagem inválida: " + trimmed);
+                String[] parts;
+                try {
+                    parts = Wire.regParts(trimmed);
+                } catch (IllegalArgumentException e) {
+                    System.out.println("REJEITADO: " + trimmed);
                     return;
                 }
 
-                String[] parts = trimmed.split(";", 4);
-                if (parts.length < 4) {
-                    System.out.println("REJEITADO; Formato REG incompleto: " + trimmed);
-                    return;
-                }
-
-                String host = parts[1];
+                String host = parts[0];
                 int port;
                 try {
-                    port = Integer.parseInt(parts[2]);
+                    port = Integer.parseInt(parts[1]);
                 } catch (NumberFormatException e) {
-                    System.out.println("REJEITADO; Porto inválido no REG: " + trimmed);
+                    System.out.println("REJEITADO: " + trimmed);
                     return;
-                }
-
-                synchronized (this) {
-                    leaderHost = host;
-                    leaderPort = port;
                 }
 
                 SensorRecord r;
                 try {
-                    r = SensorRecord.fromLine(parts[3]);
+                    r = SensorRecord.fromLine(parts[2]);
                 } catch (Exception e) {
-                    System.out.println("REJEITADO; Registo de sensor corrompido: " + trimmed);
+                    System.out.println("REJEITADO: " + trimmed);
                     return;
                 }
 
                 long rSeq = r.getSeq();
 
+                // Simulação de descarte explícito (-Ddescartar=seq) ou probabilístico (-Dperda=p)
                 synchronized (this) {
-                    if (rSeq <= seq) {
-                        System.out.println("DUPLICADO; Registo " + rSeq + " já processado.");
+                    if (descartarSeq != null && rSeq == descartarSeq) {
+                        descartarSeq = null; // Descarta apenas na primeira vez que chega pelo PubSub
+                        System.out.println("DESCARTADO (simulação): " + rSeq);
+                        return;
+                    }
+                    if (perdaProb > 0.0 && rand.nextDouble() < perdaProb) {
+                        System.out.println("DESCARTADO (simulação): " + rSeq);
                         return;
                     }
 
-                    if (rSeq == seq + 1) {
-                        file.append(r);
-                        seq = r.getSeq();
-                        System.out.println("p" + k + " Sincronizado (REG): " + r.toLine());
+                    // Aprende o endereço e porto anunciados pelo líder
+                    leaderHost = host;
+                    leaderPort = port;
 
-                        while (buffered.containsKey(seq + 1)) {
-                            SensorRecord nextR = buffered.remove(seq + 1);
-                            file.append(nextR);
-                            seq = nextR.getSeq();
-                            System.out.println("p" + k + " Sincronizado (Buffer): " + nextR.toLine());
-                        }
-                    } else {
-                        if (!buffered.containsKey(rSeq)) {
-                            buffered.put(rSeq, r);
-                            System.out.println("EM ESPERA; Retido seq " + rSeq + ". Total retidos: " + buffered.size());
-                        }
+                    aplicar(r, false);
 
-                        // Chamada direta e síncrona na thread de subscrição quando ultrapassa 10 retidos[cite: 10]
-                        if (buffered.size() > 10) {
-                            recoverFromLeader();
-                        }
+                    // Se o número de retidos exceder LIMITE_RETIDOS (10), recupera na própria thread de subscrição
+                    if (buffered.size() > Wire.LIMITE_RETIDOS) {
+                        recoverFromLeader();
                     }
                 }
             } catch (Exception e) {
-                System.out.println("REJEITADO; Erro ao processar dados: " + e.getMessage());
+                System.out.println("REJEITADO: " + msg + " (" + e.getMessage() + ")");
             }
         });
     }
 
-    private void initialRecovery() {
-        int tentativas = 0;
-        while (leaderPort == -1 && tentativas < 5) {
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException ignored) {}
-            tentativas++;
+    private synchronized void aplicar(SensorRecord r, boolean fromTcp) throws IOException {
+        long rSeq = r.getSeq();
+
+        if (rSeq <= seq || buffered.containsKey(rSeq)) {
+            if (!fromTcp) {
+                System.out.println("DUPLICADO: " + rSeq);
+            }
+            return;
         }
-        if (leaderPort != -1) {
-            recoverFromLeader();
+
+        if (rSeq == seq + 1) {
+            file.append(r);
+            seq = rSeq;
+            if (fromTcp) {
+                System.out.println("RECUPERADO: " + seq);
+            } else {
+                System.out.println("Aplicado: " + r.toLine());
+            }
+            escreverEmSequencia();
+        } else {
+            buffered.put(rSeq, r);
+            System.out.println("EM ESPERA: " + rSeq + " (falta o registo " + (seq + 1) + ") · retidos " + buffered.size());
+        }
+    }
+
+    private synchronized void escreverEmSequencia() throws IOException {
+        while (!buffered.isEmpty() && buffered.firstKey() == seq + 1) {
+            SensorRecord nextR = buffered.pollFirstEntry().getValue();
+            file.append(nextR);
+            seq = nextR.getSeq();
+            System.out.println("Aplicado (estava retido): " + nextR.toLine());
         }
     }
 
     private void recoverFromLeader() {
-        synchronized (this) {
-            if (recovering) return;
-            if (leaderPort == -1 || leaderHost == null) return;
-            recovering = true;
-        }
-
         long from;
         long to;
         String host;
         int port;
 
         synchronized (this) {
-            from = seq + 1;
-            if (buffered.isEmpty()) {
-                to = seq + 5000; 
-            } else {
-                to = buffered.firstKey() - 1;
-            }
+            if (recovering || buffered.isEmpty()) return;
+            if (leaderPort == -1 || leaderHost == null) return;
 
-            if (from > to) {
-                synchronized (this) {
-                    recovering = false;
-                }
-                return;
-            }
+            from = seq + 1;
+            to = buffered.firstKey() - 1;
+            if (from > to) return;
 
             host = leaderHost;
             port = leaderPort;
+            recovering = true;
         }
 
         System.out.println("RECUPERAÇÃO: " + from + ".." + to + " pedida a " + host + ":" + port);
 
-        try (Socket socket = new Socket(host, port);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-             PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)) {
-
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), Wire.T_TCP_MS);
             socket.setSoTimeout(Wire.T_TCP_MS);
-            out.println("PEDIDO " + from + " " + to);
 
-            String line;
-            boolean receivedFim = false;
-            while ((line = in.readLine()) != null) {
-                line = line.trim();
-                if (line.equals("FIM")) {
-                    receivedFim = true;
-                    break;
-                }
-                if (line.startsWith("ERRO")) {
-                    System.out.println("Líder rejeitou recuperação: " + line);
-                    break;
+            try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                 PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)) {
+
+                out.println("PEDIDO " + from + " " + to);
+
+                String line;
+                boolean receivedFim = false;
+                while ((line = in.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    if (line.equals("FIM")) {
+                        receivedFim = true;
+                        break;
+                    }
+                    if (line.startsWith("ERRO")) {
+                        System.out.println("RECUPERAÇÃO FALHOU: " + line);
+                        break;
+                    }
+
+                    SensorRecord r = SensorRecord.fromLine(line);
+                    synchronized (this) {
+                        aplicar(r, true);
+                    }
                 }
 
-                SensorRecord r = SensorRecord.fromLine(line);
-                synchronized (this) {
-                    if (r.getSeq() > seq) {
-                        file.append(r);
-                        seq = r.getSeq();
-                        buffered.remove(seq);
-                        // Mensagem exata exigida pela ficha[cite: 10]
-                        System.out.println("RECUPERADO: " + seq);
-                        System.out.println("p" + k + " Recuperado TCP: " + r.toLine());
+                if (!receivedFim) {
+                    System.out.println("RECUPERAÇÃO FALHOU: ligação terminou sem FIM. Estado retido mantido em memória.");
+                } else {
+                    synchronized (this) {
+                        escreverEmSequencia();
                     }
                 }
             }
-
-            if (!receivedFim) {
-                System.out.println("Aviso: Recuperação TCP incompleta (sem FIM). Estado retido mantido em memória.");
-            } else {
-                synchronized (this) {
-                    while (buffered.containsKey(seq + 1)) {
-                        SensorRecord nextR = buffered.remove(seq + 1);
-                        file.append(nextR);
-                        seq = nextR.getSeq();
-                        System.out.println("p" + k + " Sincronizado pós-TCP (Buffer): " + nextR.toLine());
-                    }
-                }
-            }
-
-        } catch (IOException e) {
-            System.out.println("Aviso: Falha na ligação TCP para recuperação (" + e.getMessage() + "). Estado retido mantido.");
+        } catch (Exception e) {
+            System.out.println("RECUPERAÇÃO FALHOU: " + e.getMessage());
         } finally {
             synchronized (this) {
                 recovering = false;
@@ -206,21 +210,29 @@ public class PartitionReplica {
     public static void main(String[] args) {
         if (args.length < 2) {
             System.out.println("Erro: Argumentos insuficientes.");
-            System.out.println("Uso: java rep02.PartitionReplica <id> <partição(ões)> [api]");
+            System.out.println("Uso: java rep02.PartitionReplica <id> <partições> [api|portoApi]");
             return;
         }
 
         String replicaId = args[0];
         String partitionsArg = args[1];
-        String api = args.length > 2 ? args[2] : "http://127.0.0.1:5001/api/v0";
+        String api = "http://127.0.0.1:5001/api/v0";
+        if (args.length > 2) {
+            if (args[2].startsWith("http://") || args[2].startsWith("https://")) {
+                api = args[2];
+            } else {
+                api = "http://127.0.0.1:" + args[2] + "/api/v0";
+            }
+        }
 
+        String finalApi = api;
         String[] parts = partitionsArg.split(",");
         for (String pStr : parts) {
             try {
                 int k = Integer.parseInt(pStr.trim());
                 new Thread(() -> {
                     try {
-                        new PartitionReplica(replicaId, k, api);
+                        new PartitionReplica(replicaId, k, finalApi);
                     } catch (Exception e) {
                         System.out.println("Erro crítico na réplica p" + k + ": " + e.getMessage());
                     }

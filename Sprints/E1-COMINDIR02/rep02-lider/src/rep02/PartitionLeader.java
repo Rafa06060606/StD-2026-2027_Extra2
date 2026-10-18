@@ -3,11 +3,13 @@ package rep02;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 public class PartitionLeader {
     private final int k;
     private final int n;
     private final int port;
+    private final Partitioner partitioner;
     private final RecordFile file;
     private long seq;
 
@@ -15,6 +17,7 @@ public class PartitionLeader {
         this.k = k;
         this.n = n;
         this.port = Wire.PORTO_BASE + k;
+        this.partitioner = new Partitioner(n);
         this.file = new RecordFile("lider-p" + k + ".txt");
         this.seq = file.lastSeq();
 
@@ -23,9 +26,7 @@ public class PartitionLeader {
         // Lança o servidor TCP de recuperação numa thread separada
         new Thread(this::startTcpServer).start();
 
-        System.out.println("Líder p" + k + " (N=" + n + ") pronto.");
-        System.out.println(" - Tópico de entrada: " + Wire.topicIn(k));
-        System.out.println(" - Servidor TCP de recuperação à escuta em: " + host + ":" + port);
+        System.out.println("Líder p" + k + " (N=" + n + "): lastSeq() = " + seq + ", subscreve " + Wire.topicIn(k) + ", à escuta em " + host + ":" + port);
 
         // Subscreve o tópico de entrada da partição k no PubSub
         pubsub.subscribe(Wire.topicIn(k), msg -> {
@@ -33,20 +34,24 @@ public class PartitionLeader {
                 String trimmedMsg = msg != null ? msg.trim() : "";
                 String[] parts = trimmedMsg.split(";");
 
-                // Validação estrita do formato: rejeita se não tiver 3 campos ou não começar por "IN"
-                if (parts.length != 3 || !parts[0].equals("IN")) {
+                if (parts.length != 3 || !parts[0].equals("IN") || parts[1].isEmpty()) {
                     System.out.println("REJEITADO: " + trimmedMsg);
                     return;
                 }
 
                 String sensor = parts[1];
                 double temp;
-
-                // Validação da temperatura: rejeita se não for um número válido
                 try {
                     temp = Double.parseDouble(parts[2]);
                 } catch (NumberFormatException e) {
                     System.out.println("REJEITADO: " + trimmedMsg);
+                    return;
+                }
+
+                // Verifica se o sensor pertence efetivamente à partição k
+                int expectedK = partitioner.of(sensor);
+                if (expectedK != k) {
+                    System.out.println("PARTIÇÃO ERRADA: " + trimmedMsg + " (pertence a p" + expectedK + ")");
                     return;
                 }
 
@@ -58,7 +63,7 @@ public class PartitionLeader {
 
                 String reg = Wire.reg(host, port, r);
                 pubsub.publish(Wire.topicData(k), reg);
-                System.out.println("p" + k + " Registado e publicado: " + r.toLine());
+                System.out.println("Registado e publicado: " + r.toLine());
 
             } catch (Exception e) {
                 System.out.println("REJEITADO: " + msg + " (Erro: " + e.getMessage() + ")");
@@ -78,10 +83,11 @@ public class PartitionLeader {
     }
 
     private void handleRecovery(Socket socket) {
-        try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-             PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)) {
+        try (Socket s = socket;
+             BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+             PrintWriter out = new PrintWriter(new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)) {
 
-            socket.setSoTimeout(Wire.T_TCP_MS);
+            s.setSoTimeout(Wire.T_TCP_MS);
             String req = in.readLine();
 
             if (req == null) return;
@@ -111,11 +117,9 @@ public class PartitionLeader {
                 top = Math.min(to, seq);
             }
 
-            // Lê o intervalo de registos de lider-p<k>.txt
-            java.util.List<SensorRecord> records = file.range(from, top);
+            List<SensorRecord> records = file.range(from, top);
 
-            // Log de recuperação ajustado ao requisito observável
-            System.out.println("RECUPERAÇÃO: " + from + ".." + top + " para " + socket.getRemoteSocketAddress() + " (" + records.size() + " registos)");
+            System.out.println("RECUPERAÇÃO: " + from + ".." + top + " para " + s.getRemoteSocketAddress() + " (" + records.size() + " registos)");
 
             for (SensorRecord r : records) {
                 out.println(r.toLine());
@@ -156,7 +160,8 @@ public class PartitionLeader {
         try {
             new PartitionLeader(k, n, host, api);
         } catch (Exception e) {
-            System.out.println("Erro crítico ao arrancar o PartitionLeader: " + e.getMessage());
+            System.out.println("Erro crítico ao arrancar o PartitionLeader:");
+            e.printStackTrace(); 
         }
     }
 }

@@ -31,7 +31,7 @@ public class IpfsPubSub {
     public void publish(String topic, String message) throws IOException, InterruptedException {
         String boundary = "rep01-" + System.nanoTime();
         String body = "--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"file\"; filename=\"msg\"\r\n"
+                + "Content-Disposition: form-data; name=\"data\"; filename=\"msg\"\r\n"
                 + "Content-Type: application/octet-stream\r\n\r\n"
                 + message + "\r\n"
                 + "--" + boundary + "--\r\n";
@@ -40,22 +40,38 @@ public class IpfsPubSub {
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() != 200) {
+        if (resp.statusCode() != 200
+                && !resp.body().contains("\"Message\":\"validation ignored\"")) {
             throw new IOException("pub falhou (" + resp.statusCode() + "): " + resp.body());
+        }
+        if (resp.statusCode() != 200) {
+            System.out.println("Aviso do Kubo ao publicar: " + resp.body());
         }
     }
 
     public void subscribe(String topic, Consumer<String> onMessage) throws IOException, InterruptedException {
-        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/sub?arg=" + toMultibase(topic)))
+        // Garantimos que usamos o tópico limpo ou codificado conforme o esperado pela API
+        String encodedTopic = toMultibase(topic);
+        if (encodedTopic == null || encodedTopic.isEmpty()) {
+            encodedTopic = topic;
+        }
+        
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/sub?arg=" + encodedTopic))
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
+                
         HttpResponse<Stream<String>> resp = http.send(req, HttpResponse.BodyHandlers.ofLines());
         if (resp.statusCode() != 200) {
             throw new IOException("sub falhou (" + resp.statusCode() + ")");
         }
         resp.body()
-                .filter(json -> json.contains("\"data\""))
-                .forEach(json -> onMessage.accept(fromMultibase(extractField(json, "data"))));
+                .filter(json -> json != null && json.contains("\"data\""))
+                .forEach(json -> {
+                    String dataField = extractField(json, "data");
+                    if (dataField != null) {
+                        onMessage.accept(fromMultibase(dataField));
+                    }
+                });
     }
 
     static String extractField(String json, String field) {
