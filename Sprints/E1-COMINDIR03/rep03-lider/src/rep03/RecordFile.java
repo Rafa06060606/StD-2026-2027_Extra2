@@ -36,6 +36,10 @@ public class RecordFile {
                 StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
+    // Converte o registo para texto e acrescenta-o ao ficheiro.
+    // CREATE cria o ficheiro, se ainda não existir.
+    // APPEND acrescenta ao fim sem apagar os registos anteriores.
+
     
     // Devolve o último registo guardado, ou null se não existir.
     public synchronized SensorRecord last() throws IOException {

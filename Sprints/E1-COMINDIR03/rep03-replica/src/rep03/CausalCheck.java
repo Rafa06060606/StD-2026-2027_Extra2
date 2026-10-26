@@ -1,3 +1,13 @@
+/*
+É a prova de que o sistema está certo. Lê os ficheiros dos líderes e confirma três coisas:
+
+V[k] == seq em cada linha.
+Quantos pares de registos de partições diferentes são causais ou concorrentes.
+A condição de Lamport: se a → b, então L(a) < L(b).
+
+Mede ainda a proporção de concorrentes que o Lamport “ordena” mesmo assim (L distinto) e escreve o vista-lamport.txt.
+*/
+
 
 package rep03;
 
@@ -71,7 +81,7 @@ public class CausalCheck {
                 "lider-p" + k + ".txt"
             );
 
-            if (!Files.isRegularFile(ficheiro)) {
+            if (!Files.isRegularFile(ficheiro)) { // ficheiro em falta: avisa e segue
                 System.out.println(
                     "[ERRO] Ficheiro em falta: " + ficheiro
                 );
@@ -91,21 +101,21 @@ public class CausalCheck {
 
                 String linha = linhas.get(numeroLinha - 1);
 
-                if (linha.isBlank()) {
+                if (linha.isBlank()) { // ignora linhas vazias
                     continue;
                 }
 
                 try {
                     SensorRecord r =
-                        SensorRecord.fromLine(linha);
+                        SensorRecord.fromLine(linha); // 6 campos; lança exceção se malformada
 
                     eventos.add(new Evento(k, r));
                     registosLidos++;
 
                     // Verificar V[k] == seq.
-                    long componente = r.getVector().get(k);
+                    long componente = r.getVector().get(k); // Obtém a componente do vetor correspondente à partição.
 
-                    if (componente != r.getSeq()) {
+                    if (componente != r.getSeq()) { /// Verifica se coincide com o número de sequência local.
                         System.out.println(
                             "[ERRO V[k] != seq] p" + k
                             + ", linha " + numeroLinha
@@ -115,7 +125,7 @@ public class CausalCheck {
                         ficheirosComProblemas = true;
                     }
 
-                } catch (RuntimeException e) {
+                } catch (RuntimeException e) {  // linha inválida: regista e continua
                     System.out.println(
                         "[ERRO] Registo inválido em "
                         + ficheiro + ", linha "
@@ -150,21 +160,21 @@ public class CausalCheck {
 
             Evento a = eventos.get(i);
 
-            for (int j = i + 1; j < eventos.size(); j++) {
+            for (int j = i + 1; j < eventos.size(); j++) { // j > i: cada par conta uma só vez
 
                 Evento b = eventos.get(j);
 
                 // A ficha pede pares de partições diferentes.
-                if (a.k == b.k) {
+                if (a.k == b.k) { // a ficha só quer partições DIFERENTES
                     continue;
                 }
 
-                VectorClock.Order ordem =
+                VectorClock.Order ordem = // Compara os relógios vetoriais de dois registos.
                     a.registo.getVector().compare(
                         b.registo.getVector()
                     );
 
-                if (ordem == VectorClock.Order.BEFORE) {
+                if (ordem == VectorClock.Order.BEFORE) { // O registo a aconteceu antes de b: a -> b.
 
                     aAntesB++;
 
@@ -178,7 +188,7 @@ public class CausalCheck {
                         );
                     }
 
-                } else if (ordem == VectorClock.Order.AFTER) {
+                } else if (ordem == VectorClock.Order.AFTER) { // O registo b aconteceu antes de a: b -> a.
 
                     bAntesA++;
 
@@ -192,11 +202,11 @@ public class CausalCheck {
                         );
                     }
 
-                } else if (ordem == VectorClock.Order.CONCURRENT) {
+                } else if (ordem == VectorClock.Order.CONCURRENT) {  // Nenhum registo aconteceu causalmente antes do outro.
 
                     concorrentes++;
 
-                    if (a.registo.getLamport()
+                    if (a.registo.getLamport() // Conta os pares concorrentes com Lamport diferente.
                             != b.registo.getLamport()) {
                         concorrentesLamportDistinto++;
                     }
@@ -248,8 +258,8 @@ public class CausalCheck {
                 .comparingLong(
                     (Evento e) -> e.registo.getLamport()
                 )
-                .thenComparingInt(e -> e.k)
-                .thenComparingLong(e -> e.registo.getSeq())
+                .thenComparingInt(e -> e.k)  // desempate: partição
+                .thenComparingLong(e -> e.registo.getSeq()) // desempate final: seq
         );
 
         Path vista = pasta.resolve("vista-lamport.txt");

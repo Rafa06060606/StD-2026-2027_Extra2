@@ -27,16 +27,16 @@ public class PartitionLeader {
         this.port = Wire.PORTO_BASE + k;
         this.partitioner = new Partitioner(n);      
 
-        this.file = new RecordFile("lider-p" + k + ".txt");
+        this.file = new RecordFile("lider-p" + k + ".txt"); // Cada partição utiliza o seu próprio ficheiro de registos.
 
-        SensorRecord ultimo = file.last();
+        SensorRecord ultimo = file.last(); // Lê o último registo guardado.
 
         if (ultimo == null) {
-            this.seq = 0;
+            this.seq = 0; // Se não existir histórico, começa com valores a zero.
             this.lamport = 0;
             this.vector = new VectorClock(n);
         } else {
-            this.seq = ultimo.getSeq();
+            this.seq = ultimo.getSeq(); // Recupera o estado anterior para continuar corretamente.
             this.lamport = ultimo.getLamport();
             this.vector = ultimo.getVector();
         }
@@ -58,6 +58,8 @@ public class PartitionLeader {
         pubsub.subscribe(Wire.topicIn(k), msg -> {
             try {
                 String trimmedMsg = msg != null ? msg.trim() : "";
+
+                // Divide a mensagem pelos pontos e vírgulas.
                 String[] parts = trimmedMsg.split(";");
 
                 // A mensagem IN tem de conter 5 campos.
@@ -65,9 +67,10 @@ public class PartitionLeader {
                         || !parts[0].equals("IN")
                         || parts[1].isEmpty()) {
                     System.out.println("REJEITADO: " + trimmedMsg);
-                    return;
+                    return; // Rejeita a mensagem inválida.
                 }
 
+                // Extrai os dados recebidos.
                 String sensor = parts[1];
                 double temp;
                 long lamportRecebido;
@@ -76,8 +79,10 @@ public class PartitionLeader {
                 try {
                     temp = Double.parseDouble(parts[2]);
                     lamportRecebido = Long.parseLong(parts[3]);
+                    // Converte o texto recebido num relógio vetorial.
                     vectorRecebido = VectorClock.parse(parts[4], n);
                 } catch (RuntimeException e) {
+                    // Se os dados não puderem ser convertidos, rejeita a mensagem.
                     System.out.println("REJEITADO: " + trimmedMsg);
                     return;
                 }
@@ -85,30 +90,33 @@ public class PartitionLeader {
                 // Confirma que o sensor pertence a esta partição.
                 int expectedK = partitioner.of(sensor);
 
+                // Compara a partição calculada com a deste líder.
                 if (expectedK != k) {
                     System.out.println(
                         "PARTIÇÃO ERRADA: " + trimmedMsg
                         + " (pertence a p" + expectedK + ")"
                     );
-                    return;
+                    return; // O líder rejeita mensagens destinadas a outra partição.
                 }
 
                 SensorRecord r;
+
+                // Evita que várias threads alterem simultaneamente o estado do líder.
                 synchronized (this) {
-                    // Atualiza o relógio de Lamport.
+                    // Relógio de Lamport: máximo entre os valores + 1.
                     lamport = Math.max(lamport, lamportRecebido) + 1;
 
                     // FALHA DELIBERADA: ignora o Lamport recebido.
                     /*lamport = lamport + 1;*/
 
-                    // Atualiza o relógio vetorial.
+                    // Incorpora o conhecimento causal recebido.
                     vector.merge(vectorRecebido);
                     vector.tick(k);
 
                     // Falha proposital para testar a recuperação de registos.
                     /*vector.tick(k);*/
 
-                    // Atribui a sequência local.
+                    // Atribui o próximo número de sequência local.
                     seq++;
                     // O componente local do vetor deve coincidir com a sequência.
                     if (vector.get(k) != seq) {
@@ -118,7 +126,7 @@ public class PartitionLeader {
                             + ", seq=" + seq
                         );
                     }
-
+                    // Cria o registo com uma cópia do relógio vetorial.
                     r = new SensorRecord(
                         seq,
                         sensor,
@@ -127,7 +135,7 @@ public class PartitionLeader {
                         lamport,
                         vector.copy()
                     );
-                    file.append(r);
+                    file.append(r); // Guarda o registo no ficheiro do líder.
                 }
 
                 // Publica o registo já atualizado.
@@ -148,10 +156,10 @@ public class PartitionLeader {
     }
 
     private void startTcpServer() {
-        try (ServerSocket server = new ServerSocket(port)) {
+        try (ServerSocket server = new ServerSocket(port)) { // Fica à espera de pedidos de recuperação das réplicas.
             while (true) {
                 Socket socket = server.accept();
-                handleRecovery(socket);
+                handleRecovery(socket); // Trata o pedido recebido através da ligação TCP.
             }
         } catch (IOException e) {
             System.out.println("Erro no servidor TCP p" + k + ": " + e.getMessage());
@@ -189,16 +197,16 @@ public class PartitionLeader {
                 return;
             }
 
-            long top;
+            long top; // Limita a recuperação ao último registo existente no líder.
             synchronized (this) {
                 top = Math.min(to, seq);
             }
-            List<SensorRecord> records = file.range(from, top);
+            List<SensorRecord> records = file.range(from, top); // Obtém os registos do intervalo solicitado.
             System.out.println("RECUPERAÇÃO: " + from + ".." + top + " para " + s.getRemoteSocketAddress() + " (" + records.size() + " registos)");
-            for (SensorRecord r : records) {
+            for (SensorRecord r : records) { // Envia cada registo para a réplica.
                 out.println(r.toLine());
             }
-            out.println("FIM");
+            out.println("FIM"); // Assinala o fim da transmissão.
         } catch (Exception e) {
             System.out.println("Erro na recuperação TCP p" + k + ": " + e.getMessage());
         }

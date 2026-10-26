@@ -1,3 +1,12 @@
+/*
+É a peça que cria dependências entre partições. Sem ele, os líderes não comunicam e todos os pares de partições 
+são concorrentes. O processador observa as N partições, acumula o que viu e, ao ver temperatura ≥ 28, escreve 
+noutra partição um ALARM-<sensor> que carrega esse conhecimento. Assim o alarme passa a depender causalmente do 
+que o processador viu.
+
+Ele não gera eventos próprios: não incrementa nada. É o líder de destino que faz o L+1 e o tick.
+*/
+
 
 package rep03;
 
@@ -15,23 +24,23 @@ public class AlarmProcessor {
     private final Partitioner partitioner;
 
     // Relógios partilhados pelas threads das partições.
-    private long Lp = 0;
-    private final VectorClock Vp;
+    private long Lp = 0; // "L do processador": máximo de L que já viu
+    private final VectorClock Vp; // "V do processador": máximo de V que já viu
 
     // Identifica os registos já processados:
     // mesma partição + mesma sequência = duplicado.
-    private final Set<String> vistos = new HashSet<>();
+    private final Set<String> vistos = new HashSet<>();  // chaves "partição:seq" já processadas
 
     public AlarmProcessor(int n, String api) {
         this.n = n;
-        this.pubsub = new IpfsPubSub(api);
-        this.partitioner = new Partitioner(n);
-        this.Vp = new VectorClock(n);
+        this.pubsub = new IpfsPubSub(api); // cliente da API do Kubo
+        this.partitioner = new Partitioner(n); // para calcular a partição do ALARM-<sensor>
+        this.Vp = new VectorClock(n); // começa a zeros: ainda não observou nada
     }
 
     public void start() {
         for (int k = 0; k < n; k++) {
-            final int particao = k;
+            final int particao = k;  // a lambda só captura variáveis "efetivamente finais"
 
             Thread thread = new Thread(() -> {
                 try {
@@ -40,8 +49,8 @@ public class AlarmProcessor {
                     System.out.println(
                             "Processador subscreve " + topic
                     );
-
-                    pubsub.subscribe(topic, mensagem -> {
+ 
+                    pubsub.subscribe(topic, mensagem -> { // subscribe BLOQUEIA para sempre: é lá que a thread fica a ler linhas do daemon
                         processar(particao, mensagem);
                     });
 
@@ -56,29 +65,29 @@ public class AlarmProcessor {
                 }
             });
 
-            thread.setName("alarm-p" + k);
-            thread.start();
+            thread.setName("alarm-p" + k); // nome para depurar
+            thread.start(); // arranca e o main continua
         }
     }
 
-    private void processar(int k, String mensagem) {
+    private void processar(int k, String mensagem) { 
         try {
             // Formato:
             // REG;host;porto;seq;sensor;temperatura;instante;L;V
-            String[] partes = mensagem.trim().split(";", 4);
+            String[] partes = mensagem.trim().split(";", 4); // REG;host;porto;<resto>  →  4 pedaços; o limite 4 é essencial: o "resto" contém ';' e fica inteiro
 
             if (partes.length != 4
-                    || !partes[0].equals("REG")) {
+                    || !partes[0].equals("REG")) {  // ignora o que não é REG
                 return;
             }
 
             // O quarto campo contém o registo completo.
-            SensorRecord r = SensorRecord.fromLine(partes[3]);
+            SensorRecord r = SensorRecord.fromLine(partes[3]);  // lê seq;sensor;temp;instante;L;V
 
             String sensor = r.getSensorId();
 
             // Ignorar alarmes para não gerar alarmes de alarmes.
-            if (sensor.startsWith("ALARM-")) {
+            if (sensor.startsWith("ALARM-")) { // sem "alarmes de alarmes"
                 return;
             }
 
@@ -88,41 +97,41 @@ public class AlarmProcessor {
             synchronized (this) {
 
                 // Ignorar duplicados da mesma partição.
-                String chave = k + ":" + r.getSeq();
+                String chave = k + ":" + r.getSeq(); // Identifica o registo pela partição e sequência.
 
-                if (!vistos.add(chave)) {
+                if (!vistos.add(chave)) {  // Ignora registos que já foram processados.
                     return;
                 }
 
-                // Acumular o conhecimento de todos os registos.
-                Lp = Math.max(Lp, r.getLamport());
-                Vp.merge(r.getVector());
+                // Atualiza o maior relógio de Lamport conhecido.
+                Lp = Math.max(Lp, r.getLamport()); // acumula Lamport
+                Vp.merge(r.getVector()); // Combina o conhecimento causal do registo recebido.
 
                 // Criar cópias consistentes para publicar.
-                Lsnapshot = Lp;
-                Vsnapshot = Vp.copy();
+                Lsnapshot = Lp; // Guarda uma fotografia independente dos relógios.
+                Vsnapshot = Vp.copy(); // ...tirada no mesmo instante, dentro do lock
 
                 // Falha proposital
                 /*Vsnapshot = Vp;*/
             }
 
-            // Temperaturas abaixo do limiar não geram alarmes.
-            if (r.getTemperature() < Wire.LIMIAR_ALARME) {
+            // Só gera alarme quando a temperatura atinge o limiar.
+            if (r.getTemperature() < Wire.LIMIAR_ALARME) { // abaixo de 28: não há alarme
                 return;
             }
 
-            String sensorAlarme = "ALARM-" + sensor;
+            String sensorAlarme = "ALARM-" + sensor; // Cria o identificador do sensor de alarme.
 
-            int j = partitioner.of(sensorAlarme);
+            int j = partitioner.of(sensorAlarme); // Descobre a partição que vai receber o alarme.
 
-            String mensagemAlarme = Wire.in(
+            String mensagemAlarme = Wire.in( // Constrói a mensagem com os relógios acumulados.
                     sensorAlarme,
                     r.getTemperature(),
                     Lsnapshot,
                     Vsnapshot
             );
 
-            pubsub.publish(
+            pubsub.publish( // Envia o alarme para o tópico de entrada da partição de destino.
                     Wire.topicIn(j),
                     mensagemAlarme
             );

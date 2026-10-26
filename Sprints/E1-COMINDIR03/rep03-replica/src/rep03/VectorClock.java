@@ -1,4 +1,6 @@
 
+// Comparar relógios vetoriais linha 52
+
 package rep03;
 
 import java.util.Arrays;
@@ -47,8 +49,8 @@ public final class VectorClock {
     }
 
     // Determina a relação entre este vetor e outro.
-    public Order compare(VectorClock other) {
-        if (v.length != other.v.length) {
+    public Order compare(VectorClock other) { 
+        if (v.length != other.v.length) {  // Os vetores têm de ter o mesmo número de componentes.
             throw new IllegalArgumentException(
                 "Os vetores têm dimensões diferentes."
             );
@@ -57,7 +59,7 @@ public final class VectorClock {
         boolean menor = false;
         boolean maior = false;
 
-        for (int i = 0; i < v.length; i++) {
+        for (int i = 0; i < v.length; i++) { // Compara componente a componente.
             if (v[i] < other.v[i]) {
                 menor = true;
             }
@@ -67,19 +69,19 @@ public final class VectorClock {
             }
         }
 
-        if (menor && maior) {
+        if (menor && maior) { // Se cada vetor for maior em pelo menos uma componente os acontecimentos são concorrentes.
             return Order.CONCURRENT;
         }
 
-        if (menor) {
+        if (menor) {  // O primeiro vetor é anterior ao segundo.
             return Order.BEFORE;
         }
 
-        if (maior) {
+        if (maior) { // O primeiro vetor é posterior ao segundo.
             return Order.AFTER;
         }
 
-        return Order.EQUAL;
+        return Order.EQUAL; // Todas as componentes são iguais.
     }
 
     // Representação: v0,v1,...,vN-1

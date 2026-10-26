@@ -107,16 +107,16 @@ public class PartitionReplica {
     }
 
     private synchronized void aplicar(SensorRecord r, boolean fromTcp) throws IOException {
-        long rSeq = r.getSeq();
+        long rSeq = r.getSeq();  // Obtém o número de sequência do registo recebido.
 
-        if (rSeq <= seq || buffered.containsKey(rSeq)) {
-            if (!fromTcp) {
+        if (rSeq <= seq || buffered.containsKey(rSeq)) { // Ignora registos já aplicados ou que já estão em espera.
+            if (!fromTcp) { 
                 System.out.println("DUPLICADO: " + rSeq);
             }
             return;
         }
 
-        if (rSeq == seq + 1) {
+        if (rSeq == seq + 1) { // Se for o próximo registo esperado, pode ser guardado.
             file.append(r);
             seq = rSeq;
             if (fromTcp) {
@@ -125,8 +125,10 @@ public class PartitionReplica {
                 System.out.println("Aplicado: " + r.toLine());
             }
             escreverEmSequencia();
+            // Depois, o código verifica se existem outros registos
+            // em espera que possam agora ser aplicados.
         } else {
-            buffered.put(rSeq, r);
+            buffered.put(rSeq, r); // Se faltar uma sequência anterior, guarda temporariamente.
             System.out.println("EM ESPERA: " + rSeq + " (falta o registo " + (seq + 1) + ") · retidos " + buffered.size());
         }
     }

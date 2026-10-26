@@ -11,8 +11,8 @@ public final class Wire {
     public static String topicData(int k) { return "rep03-p" + k; }
 
     
-    public static String in(String sensor, double temp,
-                            long lamport, VectorClock vector) {
+    public static String in(String sensor, double temp,  
+                            long lamport, VectorClock vector) { // Constrói uma mensagem de entrada no formato: IN;sensor;temperatura;lamport;vetor
         return "IN;" + sensor + ";" + temp + ";"
             + lamport + ";" + vector.toString();
     }
