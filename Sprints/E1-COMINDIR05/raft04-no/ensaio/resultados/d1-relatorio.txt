@@ -1,0 +1,151 @@
+=== RAFT CHECK ===
+Partições: 3 | pasta: C:\Users\renat\Desktop\escola\SDT\StD-2026-2027_Extra2\Sprints\E1-COMINDIR05\raft04-no\ensaio\.
+
+################ p0 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n2(3 votos) → líder n2 | eleição 53 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 7218 ms (7,2 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n2)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=272 n2=272 n3=272 | comparados até seq 272 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p1 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n2(3 votos) → líder n2 | eleição 50 ms
+termo 2: candidatos n3(2 votos) → líder n3 | eleição 20 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 7016 ms (7,0 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+falha p1;n2 (líder do termo 1) @1794165109695: indisponibilidade 7535 ms (7,5 s), novo líder n3 termo 2 | leituras enviadas nesse intervalo: 62
+falha p1;n2 @1794165139717: n2 não era o líder (era n3, termo 2): sem indisponibilidade.
+-- Registos truncados --
+n2 @1794165141267: TRUNCADO de=1;descartados=207;termos=1 | destes, existem com outro seq no registo final do líder n3: 107 de 207
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=107 n2=107 n3=107 | comparados até seq 107 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p2 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n2(3 votos) → líder n2 | eleição 44 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 7104 ms (7,1 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n2)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=205 n2=205 n3=205 | comparados até seq 205 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ Leituras perdidas ################
+p0: enviadas 239, perdidas 0
+p1: enviadas 171, perdidas 83
+   perdida: 1794165109454;p1;S08;17.6
+   perdida: 1794165109482;p1;S02;21.0
+   perdida: 1794165109491;p1;S05;28.8
+   perdida: 1794165109528;p1;S02;21.0
+   perdida: 1794165109558;p1;S08;17.0
+   perdida: 1794165109583;p1;S05;24.1
+   perdida: 1794165109592;p1;S08;24.8
+   perdida: 1794165109596;p1;S08;21.0
+   perdida: 1794165109600;p1;S05;28.5
+   perdida: 1794165109608;p1;S08;21.7
+   perdida: 1794165109619;p1;S02;19.2
+   perdida: 1794165109624;p1;S08;24.9
+   perdida: 1794165109628;p1;S02;27.6
+   perdida: 1794165109635;p1;S02;24.8
+   perdida: 1794165109647;p1;S05;18.9
+   perdida: 1794165109652;p1;S08;20.7
+   perdida: 1794165109686;p1;S08;19.7
+   perdida: 1794165109707;p1;S08;16.8
+   perdida: 1794165109715;p1;S05;25.4
+   perdida: 1794165109724;p1;S05;21.2
+   perdida: 1794165109732;p1;S02;27.8
+   perdida: 1794165109789;p1;S02;16.6
+   perdida: 1794165109801;p1;S02;24.7
+   perdida: 1794165109829;p1;S05;25.6
+   perdida: 1794165109861;p1;S05;20.2
+   perdida: 1794165109866;p1;S05;16.1
+   perdida: 1794165109873;p1;S02;25.9
+   perdida: 1794165109904;p1;S08;23.3
+   perdida: 1794165109913;p1;S08;25.1
+   perdida: 1794165109942;p1;S05;27.6
+   perdida: 1794165109964;p1;S05;18.7
+   perdida: 1794165109987;p1;S08;22.2
+   perdida: 1794165109996;p1;S08;22.2
+   perdida: 1794165110012;p1;S02;25.1
+   perdida: 1794165110056;p1;S08;21.2
+   perdida: 1794165110062;p1;S05;23.8
+   perdida: 1794165110086;p1;S05;18.3
+   perdida: 1794165110121;p1;S05;27.1
+   perdida: 1794165110125;p1;S08;16.1
+   perdida: 1794165110141;p1;S08;20.2
+   perdida: 1794165110146;p1;S02;15.0
+   perdida: 1794165110150;p1;S02;22.1
+   perdida: 1794165110163;p1;S08;20.8
+   perdida: 1794165110167;p1;S05;20.9
+   perdida: 1794165110171;p1;S05;19.4
+   perdida: 1794165110183;p1;S02;26.0
+   perdida: 1794165110190;p1;S08;19.8
+   perdida: 1794165110219;p1;S05;20.3
+   perdida: 1794165110254;p1;S05;15.0
+   perdida: 1794165110276;p1;S02;27.6
+   perdida: 1794165110326;p1;S05;19.4
+   perdida: 1794165110330;p1;S05;27.1
+   perdida: 1794165110379;p1;S08;19.1
+   perdida: 1794165110388;p1;S02;28.3
+   perdida: 1794165110392;p1;S08;22.7
+   perdida: 1794165110411;p1;S05;17.5
+   perdida: 1794165110420;p1;S02;19.6
+   perdida: 1794165110465;p1;S02;21.6
+   perdida: 1794165110470;p1;S08;26.1
+   perdida: 1794165110501;p1;S02;19.3
+   perdida: 1794165110512;p1;S05;22.4
+   perdida: 1794165110531;p1;S08;17.9
+   perdida: 1794165110562;p1;S02;21.8
+   perdida: 1794165110570;p1;S05;21.6
+   perdida: 1794165110597;p1;S02;24.2
+   perdida: 1794165110613;p1;S02;27.3
+   perdida: 1794165110662;p1;S05;22.2
+   perdida: 1794165110698;p1;S05;16.5
+   perdida: 1794165110708;p1;S08;24.6
+   perdida: 1794165110723;p1;S08;19.9
+   perdida: 1794165124718;p1;S08;26.2
+   perdida: 1794165124801;p1;S02;28.2
+   perdida: 1794165124972;p1;S05;21.0
+   perdida: 1794165125132;p1;S08;22.0
+   perdida: 1794165125150;p1;S02;21.5
+   perdida: 1794165125222;p1;S08;25.0
+   perdida: 1794165125304;p1;S02;24.3
+   perdida: 1794165125454;p1;S02;22.5
+   perdida: 1794165125461;p1;S08;22.4
+   perdida: 1794165125507;p1;S02;26.8
+   perdida: 1794165125663;p1;S05;29.7
+   perdida: 1794165125696;p1;S08;15.4
+   perdida: 1794165125752;p1;S02;24.9
+p2: enviadas 190, perdidas 0
+Total de leituras perdidas: 83
+
+################ Monitores ################
+monitor-processador.txt: {IGNORADO=1, NOVO_LIDER=4, RECEBIDO=84, RETOMA=4, SUSPEITA=4}
+monitor-produtor.txt: {NOVO_LIDER=4, RETOMA=4, SUSPEITA=4}
+
+=== RESUMO ===
+Termos com mais de um LIDER (tem de ser 0): 0
+Registos descartados (TRUNCADO): 207
+seq divergentes na coincidência final: 0
+=== FIM ===

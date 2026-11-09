@@ -1,0 +1,10 @@
+ARRANQUE;p1;no=n3;seq=0;ultimoTermo=0;termo=0;porto=7005
+Nó pronto: papel=SEGUIDOR termo=0 seq=0 | TCP em 127.0.0.1:7005
+TERMO;p1;0->1
+VOTO;p1;termo=1;candidato=n2;concedido
+NOVO_LIDER;p1;termo=1;lider=n2
+RECEBIDO;p1;termo=1;lider=n2;hb=1;ultimoSeq=0;n=0;seq=-
+RECEBIDO;p1;termo=1;lider=n2;hb=2;ultimoSeq=0;n=0;seq=-
+RECEBIDO;p1;termo=1;lider=n2;hb=3;ultimoSeq=0;n=0;seq=-
+RECEBIDO;p1;termo=1;lider=n2;hb=4;ultimoSeq=0;n=0;seq=-
+RECEBIDO;p1;termo=1;lider=n2;hb=5;ultimoSeq=0;n=0;seq=-

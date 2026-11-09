@@ -1,0 +1,11 @@
+ARRANQUE;p0;no=n3;seq=0;ultimoTermo=0;termo=0;porto=7002
+Nó pronto: papel=SEGUIDOR termo=0 seq=0 | TCP em 127.0.0.1:7002
+CANDIDATO;p0;termo=1
+Aviso do Kubo ao publicar: {"Message":"validation ignored","Code":0,"Type":"error"}
+
+VOTO;p0;termo=1;candidato=n1;recusado
+VOTO;p0;termo=1;candidato=n2;recusado
+CANDIDATO;p0;termo=2
+VOTO;p0;termo=2;candidato=n1;recusado
+LIDER;p0;termo=2;votos=[2, 3]
+Passei a líder: termo=2 seq=0 L=0 V=0,0,0

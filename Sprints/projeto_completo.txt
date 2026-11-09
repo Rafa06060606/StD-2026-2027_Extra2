@@ -1,0 +1,3460 @@
+﻿=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-lider\src\rep02\IpfsPubSub.java ===
+package rep02;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+public class IpfsPubSub {
+    private final String api;
+    private final HttpClient http = HttpClient.newHttpClient();
+
+    public IpfsPubSub(String api) {
+        this.api = api;
+    }
+
+    static String toMultibase(String s) {
+        return "u" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(s.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String fromMultibase(String s) {
+        if (!s.startsWith("u")) {
+            throw new IllegalArgumentException("Codificação multibase não suportada: " + s);
+        }
+        return new String(Base64.getUrlDecoder().decode(s.substring(1)), StandardCharsets.UTF_8);
+    }
+
+    public void publish(String topic, String message) throws IOException, InterruptedException {
+        String boundary = "rep01-" + System.nanoTime();
+        String body = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"file\"; filename=\"msg\"\r\n"
+                + "Content-Type: application/octet-stream\r\n\r\n"
+                + message + "\r\n"
+                + "--" + boundary + "--\r\n";
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/pub?arg=" + toMultibase(topic)))
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("pub falhou (" + resp.statusCode() + "): " + resp.body());
+        }
+    }
+
+    public void subscribe(String topic, Consumer<String> onMessage) throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/sub?arg=" + toMultibase(topic)))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+        HttpResponse<Stream<String>> resp = http.send(req, HttpResponse.BodyHandlers.ofLines());
+        if (resp.statusCode() != 200) {
+            throw new IOException("sub falhou (" + resp.statusCode() + ")");
+        }
+        resp.body()
+                .filter(json -> json.contains("\"data\""))
+                .forEach(json -> onMessage.accept(fromMultibase(extractField(json, "data"))));
+    }
+
+    static String extractField(String json, String field) {
+        String key = "\"" + field + "\":\"";
+        int start = json.indexOf(key);
+        if (start < 0) {
+            throw new IllegalArgumentException("Campo '" + field + "' ausente: " + json);
+        }
+        start += key.length();
+        return json.substring(start, json.indexOf('"', start));
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-lider\src\rep02\Partitioner.java ===
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-lider\src\rep02\PartitionLeader.java ===
+package rep02;
+
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+
+public class PartitionLeader {
+    private final int k;
+    private final int n;
+    private final int port;
+    private final RecordFile file;
+    private long seq;
+
+    public PartitionLeader(int k, int n, String host, String api) throws Exception {
+        this.k = k;
+        this.n = n;
+        this.port = Wire.PORTO_BASE + k;
+        this.file = new RecordFile("lider-p" + k + ".txt");
+        this.seq = file.lastSeq();
+
+        IpfsPubSub pubsub = new IpfsPubSub(api);
+
+        // Lança o servidor TCP de recuperação numa thread separada
+        new Thread(this::startTcpServer).start();
+
+        System.out.println("Líder p" + k + " (N=" + n + ") pronto.");
+        System.out.println(" - Tópico de entrada: " + Wire.topicIn(k));
+        System.out.println(" - Servidor TCP de recuperação à escuta em: " + host + ":" + port);
+
+        // Subscreve o tópico de entrada da partição k no PubSub
+        pubsub.subscribe(Wire.topicIn(k), msg -> {
+            try {
+                String trimmedMsg = msg != null ? msg.trim() : "";
+                String[] parts = trimmedMsg.split(";");
+
+                // Validação estrita do formato: rejeita se não tiver 3 campos ou não começar por "IN"
+                if (parts.length != 3 || !parts[0].equals("IN")) {
+                    System.out.println("REJEITADO: " + trimmedMsg);
+                    return;
+                }
+
+                String sensor = parts[1];
+                double temp;
+
+                // Validação da temperatura: rejeita se não for um número válido
+                try {
+                    temp = Double.parseDouble(parts[2]);
+                } catch (NumberFormatException e) {
+                    System.out.println("REJEITADO: " + trimmedMsg);
+                    return;
+                }
+
+                SensorRecord r;
+                synchronized (this) {
+                    r = SensorRecord.now(++seq, sensor, temp);
+                    file.append(r);
+                }
+
+                String reg = Wire.reg(host, port, r);
+                pubsub.publish(Wire.topicData(k), reg);
+                System.out.println("p" + k + " Registado e publicado: " + r.toLine());
+
+            } catch (Exception e) {
+                System.out.println("REJEITADO: " + msg + " (Erro: " + e.getMessage() + ")");
+            }
+        });
+    }
+
+    private void startTcpServer() {
+        try (ServerSocket server = new ServerSocket(port)) {
+            while (true) {
+                Socket socket = server.accept();
+                handleRecovery(socket);
+            }
+        } catch (IOException e) {
+            System.out.println("Erro no servidor TCP p" + k + ": " + e.getMessage());
+        }
+    }
+
+    private void handleRecovery(Socket socket) {
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+             PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)) {
+
+            socket.setSoTimeout(Wire.T_TCP_MS);
+            String req = in.readLine();
+
+            if (req == null) return;
+            String[] p = req.trim().split("\\s+");
+
+            if (p.length != 3 || !p[0].equals("PEDIDO")) {
+                out.println("ERRO Pedido mal formado");
+                return;
+            }
+
+            long from, to;
+            try {
+                from = Long.parseLong(p[1]);
+                to = Long.parseLong(p[2]);
+            } catch (NumberFormatException e) {
+                out.println("ERRO Valores numéricos inválidos");
+                return;
+            }
+
+            if (from > to) {
+                out.println("ERRO Intervalo inválido (from > to)");
+                return;
+            }
+
+            long top;
+            synchronized (this) {
+                top = Math.min(to, seq);
+            }
+
+            // Lê o intervalo de registos de lider-p<k>.txt
+            java.util.List<SensorRecord> records = file.range(from, top);
+
+            // Log de recuperação ajustado ao requisito observável
+            System.out.println("RECUPERAÇÃO: " + from + ".." + top + " para " + socket.getRemoteSocketAddress() + " (" + records.size() + " registos)");
+
+            for (SensorRecord r : records) {
+                out.println(r.toLine());
+            }
+            out.println("FIM");
+
+        } catch (Exception e) {
+            System.out.println("Erro na recuperação TCP p" + k + ": " + e.getMessage());
+        }
+    }
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("Erro: Argumentos insuficientes.");
+            System.out.println("Uso: java rep02.PartitionLeader <k> <N> [endereço] [api]");
+            return;
+        }
+
+        int k, n;
+        try {
+            k = Integer.parseInt(args[0]);
+            n = Integer.parseInt(args[1]);
+        } catch (NumberFormatException e) {
+            System.out.println("Erro: Os parâmetros <k> e <N> têm de ser valores numéricos inteiros.");
+            System.out.println("Uso: java rep02.PartitionLeader <k> <N> [endereço] [api]");
+            return;
+        }
+
+        if (n <= 0 || k < 0 || k >= n) {
+            System.out.println("Erro: Partição inválida (k=" + k + " para N=" + n + "). O valor de k deve estar compreendido entre 0 e " + (n - 1) + ".");
+            System.out.println("Uso: java rep02.PartitionLeader <k> <N> [endereço] [api]");
+            return;
+        }
+
+        String host = args.length > 2 ? args[2] : "127.0.0.1";
+        String api = args.length > 3 ? args[3] : "http://127.0.0.1:5001/api/v0";
+
+        try {
+            new PartitionLeader(k, n, host, api);
+        } catch (Exception e) {
+            System.out.println("Erro crítico ao arrancar o PartitionLeader: " + e.getMessage());
+        }
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-lider\src\rep02\RecordFile.java ===
+package rep02;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class RecordFile {
+    private final Path path;
+
+    public RecordFile(String fileName) {
+        this.path = Paths.get(fileName);
+    }
+
+    public synchronized List<SensorRecord> range(long from, long to) throws IOException {
+        List<SensorRecord> out = new ArrayList<>();
+        if (!Files.exists(path)) {
+            return out;
+        }
+        for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) {
+                continue;
+            }
+            SensorRecord r = SensorRecord.fromLine(line);
+            if (r.getSeq() >= from && r.getSeq() <= to) {
+                out.add(r);
+            }
+        }
+        return out;
+    }
+
+    // acrescenta uma linha ao fim do ficheiro (cria-o se não existir)
+    public synchronized void append(SensorRecord r) throws IOException {
+        Files.writeString(path, r.toLine() + System.lineSeparator(), StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+
+    // número de sequência do último registo guardado (0 se o ficheiro não existir)
+    public synchronized long lastSeq() throws IOException {
+        if (!Files.exists(path)) {
+            return 0;
+        }
+        long last = 0;
+        for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+            if (!line.isBlank()) {
+                last = SensorRecord.fromLine(line).getSeq();
+            }
+        }
+        return last;
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-lider\src\rep02\SensorRecord.java ===
+package rep02;
+
+import java.time.LocalDateTime;
+
+public class SensorRecord {
+    private final long seq;
+    private final String sensorId;
+    private final double temperature;
+    private final String timestamp;
+
+    public SensorRecord(long seq, String sensorId, double temperature, String timestamp) {
+        this.seq = seq;
+        this.sensorId = sensorId;
+        this.temperature = temperature;
+        this.timestamp = timestamp;
+    }
+
+    public static SensorRecord now(long seq, String sensorId, double temperature) {
+        return new SensorRecord(seq, sensorId, temperature, LocalDateTime.now().withNano(0).toString());
+    }
+
+    public String toLine() {
+        return seq + ";" + sensorId + ";" + temperature + ";" + timestamp;
+    }
+
+    public static SensorRecord fromLine(String line) {
+        String[] f = line.trim().split(";");
+        if (f.length != 4) {
+            throw new IllegalArgumentException("Registo mal formado: " + line);
+        }
+        return new SensorRecord(Long.parseLong(f[0]), f[1], Double.parseDouble(f[2]), f[3]);
+    }
+
+    public long getSeq() { return seq; }
+    public String getSensorId() { return sensorId; }
+    public double getTemperature() { return temperature; }
+    public String getTimestamp() { return timestamp; }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-lider\src\rep02\Wire.java ===
+package rep02;
+
+public final class Wire {
+    public static final int LIMITE_RETIDOS = 10;   // acima deste número de retidos, a réplica recupera
+    public static final int T_TCP_MS = 5000;       // tempo máximo de ligação e de espera por cada linha
+    public static final int PORTO_BASE = 7000;     // porto de recuperação do líder da partição k: 7000 + k
+
+    private Wire() { }
+
+    public static String topicIn(int k)   { return "rep02-in-p" + k; }
+    public static String topicData(int k) { return "rep02-p" + k; }
+
+    public static String in(String sensor, double temp) { return "IN;" + sensor + ";" + temp; }
+
+    // REG;<endereço>;<porto>;<seq>;<sensor>;<temperatura>;<instante>
+    public static String reg(String host, int port, SensorRecord r) {
+        return "REG;" + host + ";" + port + ";" + r.toLine();
+    }
+
+    // tipo da mensagem (IN, REG); lança IllegalArgumentException se não houver tipo
+    public static String type(String msg) {
+        String m = msg.trim();
+        int i = m.indexOf(';');
+        if (i <= 0) {
+            throw new IllegalArgumentException("Mensagem sem tipo: " + msg);
+        }
+        return m.substring(0, i);
+    }
+
+    // conteúdo da mensagem sem o tipo
+    public static String body(String msg) {
+        String m = msg.trim();
+        return m.substring(m.indexOf(';') + 1);
+    }
+
+    // divide uma mensagem REG em { endereço, porto, linha do registo }
+    public static String[] regParts(String msg) {
+        String[] f = msg.trim().split(";", 4);
+        if (f.length != 4 || !f[0].equals("REG")) {
+            throw new IllegalArgumentException("REG mal formado: " + msg);
+        }
+        return new String[] { f[1], f[2], f[3] };
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-produtor\src\rep02\IpfsPubSub.java ===
+package rep02;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+public class IpfsPubSub {
+    private final String api;
+    private final HttpClient http = HttpClient.newHttpClient();
+
+    public IpfsPubSub(String api) {
+        this.api = api;
+    }
+
+    static String toMultibase(String s) {
+        return "u" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(s.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String fromMultibase(String s) {
+        if (!s.startsWith("u")) {
+            throw new IllegalArgumentException("Codificação multibase não suportada: " + s);
+        }
+        return new String(Base64.getUrlDecoder().decode(s.substring(1)), StandardCharsets.UTF_8);
+    }
+
+    public void publish(String topic, String message) throws IOException, InterruptedException {
+        String boundary = "rep01-" + System.nanoTime();
+        String body = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"file\"; filename=\"msg\"\r\n"
+                + "Content-Type: application/octet-stream\r\n\r\n"
+                + message + "\r\n"
+                + "--" + boundary + "--\r\n";
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/pub?arg=" + toMultibase(topic)))
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("pub falhou (" + resp.statusCode() + "): " + resp.body());
+        }
+    }
+
+    public void subscribe(String topic, Consumer<String> onMessage) throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/sub?arg=" + toMultibase(topic)))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+        HttpResponse<Stream<String>> resp = http.send(req, HttpResponse.BodyHandlers.ofLines());
+        if (resp.statusCode() != 200) {
+            throw new IOException("sub falhou (" + resp.statusCode() + ")");
+        }
+        resp.body()
+                .filter(json -> json.contains("\"data\""))
+                .forEach(json -> onMessage.accept(fromMultibase(extractField(json, "data"))));
+    }
+
+    static String extractField(String json, String field) {
+        String key = "\"" + field + "\":\"";
+        int start = json.indexOf(key);
+        if (start < 0) {
+            throw new IllegalArgumentException("Campo '" + field + "' ausente: " + json);
+        }
+        start += key.length();
+        return json.substring(start, json.indexOf('"', start));
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-produtor\src\rep02\Partitioner.java ===
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-produtor\src\rep02\Producer.java ===
+package rep02;
+
+import java.util.Scanner;
+import java.util.Random;
+
+public class Producer {
+    public static void main(String[] args) {
+        String api = args.length > 0 ? args[0] : "http://127.0.0.1:5001/api/v0";
+        IpfsPubSub pubsub = new IpfsPubSub(api);
+        Random rand = new Random();
+
+        try (Scanner sc = new Scanner(System.in)) {
+            System.out.println("Produtor pronto (Parte A). Formato: <sensor> <temperatura> | 'rajada <n> <s>' | 'sair'");
+
+            while (true) {
+                System.out.print("> ");
+                if (!sc.hasNextLine()) break;
+                String line = sc.nextLine().trim();
+                if (line.isEmpty()) continue;
+                if (line.equalsIgnoreCase("sair")) break;
+
+                if (line.toLowerCase().startsWith("rajada")) {
+                    String[] parts = line.split("\\s+");
+                    int n = parts.length > 1 ? Integer.parseInt(parts[1]) : 5;
+                    int sMax = parts.length > 2 ? Integer.parseInt(parts[2]) : 1;
+
+                    System.out.println("A iniciar rajada de " + n + " leituras (sensores S01 a S" + String.format("%02d", sMax) + ")...");
+                    
+                    long tStart = System.currentTimeMillis();
+                    for (int i = 0; i < n; i++) {
+                        int sIndex = 1 + rand.nextInt(sMax);
+                        String sensor = String.format("S%02d", sIndex);
+                        double temp = 15 + rand.nextDouble() * 15;
+                        
+                        String msg = Wire.in(sensor, temp);
+                        pubsub.publish(Wire.topicIn(0), msg);
+                    }
+                    long tEnd = System.currentTimeMillis();
+
+                    System.out.println("Rajada concluída.");
+                    System.out.println("Primeira publicação: " + tStart + " ms | Última publicação: " + tEnd + " ms (Total: " + (tEnd - tStart) + " ms)");
+                    continue;
+                }
+
+                String[] p = line.split("\\s+");
+                if (p.length != 2) {
+                    System.out.println("Formato inválido. Usa: <sensor> <temperatura>");
+                    continue;
+                }
+
+                String sensor = p[0];
+                double temp;
+                
+                try {
+                    temp = Double.parseDouble(p[1]);
+                } catch (NumberFormatException e) {
+                    System.out.println("Temperatura inválida: " + p[1]);
+                    continue;
+                }
+
+                String msg = Wire.in(sensor, temp);
+                pubsub.publish(Wire.topicIn(0), msg);
+                System.out.println("Publicado em " + Wire.topicIn(0) + ": " + msg);
+            }
+        } catch (Exception e) {
+            System.out.println("Erro no Produtor: " + e.getMessage());
+        }
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-produtor\src\rep02\RecordFile.java ===
+package rep02;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class RecordFile {
+    private final Path path;
+
+    public RecordFile(String fileName) {
+        this.path = Paths.get(fileName);
+    }
+
+    // acrescenta uma linha ao fim do ficheiro (cria-o se não existir)
+    public synchronized void append(SensorRecord r) throws IOException {
+        Files.writeString(path, r.toLine() + System.lineSeparator(), StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+
+    // número de sequência do último registo guardado (0 se o ficheiro não existir)
+    public synchronized long lastSeq() throws IOException {
+        if (!Files.exists(path)) {
+            return 0;
+        }
+        long last = 0;
+        for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+            if (!line.isBlank()) {
+                last = SensorRecord.fromLine(line).getSeq();
+            }
+        }
+        return last;
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-produtor\src\rep02\SensorRecord.java ===
+package rep02;
+
+import java.time.LocalDateTime;
+
+public class SensorRecord {
+    private final long seq;
+    private final String sensorId;
+    private final double temperature;
+    private final String timestamp;
+
+    public SensorRecord(long seq, String sensorId, double temperature, String timestamp) {
+        this.seq = seq;
+        this.sensorId = sensorId;
+        this.temperature = temperature;
+        this.timestamp = timestamp;
+    }
+
+    public static SensorRecord now(long seq, String sensorId, double temperature) {
+        return new SensorRecord(seq, sensorId, temperature, LocalDateTime.now().withNano(0).toString());
+    }
+
+    public String toLine() {
+        return seq + ";" + sensorId + ";" + temperature + ";" + timestamp;
+    }
+
+    public static SensorRecord fromLine(String line) {
+        String[] f = line.trim().split(";");
+        if (f.length != 4) {
+            throw new IllegalArgumentException("Registo mal formado: " + line);
+        }
+        return new SensorRecord(Long.parseLong(f[0]), f[1], Double.parseDouble(f[2]), f[3]);
+    }
+
+    public long getSeq() { return seq; }
+    public String getSensorId() { return sensorId; }
+    public double getTemperature() { return temperature; }
+    public String getTimestamp() { return timestamp; }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-produtor\src\rep02\Wire.java ===
+package rep02;
+
+public final class Wire {
+    public static final int LIMITE_RETIDOS = 10;   // acima deste número de retidos, a réplica recupera
+    public static final int T_TCP_MS = 5000;       // tempo máximo de ligação e de espera por cada linha
+    public static final int PORTO_BASE = 7000;     // porto de recuperação do líder da partição k: 7000 + k
+
+    private Wire() { }
+
+    public static String topicIn(int k)   { return "rep02-in-p" + k; }
+    public static String topicData(int k) { return "rep02-p" + k; }
+
+    public static String in(String sensor, double temp) { return "IN;" + sensor + ";" + temp; }
+
+    // REG;<endereço>;<porto>;<seq>;<sensor>;<temperatura>;<instante>
+    public static String reg(String host, int port, SensorRecord r) {
+        return "REG;" + host + ";" + port + ";" + r.toLine();
+    }
+
+    // tipo da mensagem (IN, REG); lança IllegalArgumentException se não houver tipo
+    public static String type(String msg) {
+        String m = msg.trim();
+        int i = m.indexOf(';');
+        if (i <= 0) {
+            throw new IllegalArgumentException("Mensagem sem tipo: " + msg);
+        }
+        return m.substring(0, i);
+    }
+
+    // conteúdo da mensagem sem o tipo
+    public static String body(String msg) {
+        String m = msg.trim();
+        return m.substring(m.indexOf(';') + 1);
+    }
+
+    // divide uma mensagem REG em { endereço, porto, linha do registo }
+    public static String[] regParts(String msg) {
+        String[] f = msg.trim().split(";", 4);
+        if (f.length != 4 || !f[0].equals("REG")) {
+            throw new IllegalArgumentException("REG mal formado: " + msg);
+        }
+        return new String[] { f[1], f[2], f[3] };
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\IpfsPubSub.java ===
+package rep02;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+public class IpfsPubSub {
+    private final String api;
+    private final HttpClient http = HttpClient.newHttpClient();
+
+    public IpfsPubSub(String api) {
+        this.api = api;
+    }
+
+    static String toMultibase(String s) {
+        return "u" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(s.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String fromMultibase(String s) {
+        if (!s.startsWith("u")) {
+            throw new IllegalArgumentException("Codificação multibase não suportada: " + s);
+        }
+        return new String(Base64.getUrlDecoder().decode(s.substring(1)), StandardCharsets.UTF_8);
+    }
+
+    public void publish(String topic, String message) throws IOException, InterruptedException {
+        String boundary = "rep01-" + System.nanoTime();
+        String body = "--" + boundary + "\r\n"
+                + "Content-Disposition: form-data; name=\"file\"; filename=\"msg\"\r\n"
+                + "Content-Type: application/octet-stream\r\n\r\n"
+                + message + "\r\n"
+                + "--" + boundary + "--\r\n";
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/pub?arg=" + toMultibase(topic)))
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IOException("pub falhou (" + resp.statusCode() + "): " + resp.body());
+        }
+    }
+
+    public void subscribe(String topic, Consumer<String> onMessage) throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(api + "/pubsub/sub?arg=" + toMultibase(topic)))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+        HttpResponse<Stream<String>> resp = http.send(req, HttpResponse.BodyHandlers.ofLines());
+        if (resp.statusCode() != 200) {
+            throw new IOException("sub falhou (" + resp.statusCode() + ")");
+        }
+        resp.body()
+                .filter(json -> json.contains("\"data\""))
+                .forEach(json -> onMessage.accept(fromMultibase(extractField(json, "data"))));
+    }
+
+    static String extractField(String json, String field) {
+        String key = "\"" + field + "\":\"";
+        int start = json.indexOf(key);
+        if (start < 0) {
+            throw new IllegalArgumentException("Campo '" + field + "' ausente: " + json);
+        }
+        start += key.length();
+        return json.substring(start, json.indexOf('"', start));
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\PartitionCheck.java ===
+package rep02;
+
+import java.io.File;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+public class PartitionCheck {
+
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("Uso: java rep02.PartitionCheck <k> [N]");
+            return;
+        }
+
+        int k, n;
+        try {
+            k = Integer.parseInt(args[0]);
+            n = args.length > 1 ? Integer.parseInt(args[1]) : 1;
+        } catch (NumberFormatException e) {
+            System.out.println("Erro: <k> e [N] devem ser números inteiros.");
+            return;
+        }
+
+        if (n <= 0 || k < 0 || k >= n) {
+            System.out.println("Erro: Partição inválida (k=" + k + " para N=" + n + ").");
+            return;
+        }
+
+        Partitioner partitioner = new Partitioner(n);
+        String leaderFileName = "lider-p" + k + ".txt";
+        File leaderFile = new File(leaderFileName);
+
+        System.out.println("=== Validação da Partição p" + k + " (N=" + n + ") ===");
+
+        // 1. Encontrar lider-p<k>.txt
+        if (!leaderFile.exists()) {
+            System.out.println("[ERRO] Ficheiro do líder não encontrado: " + leaderFileName);
+            return;
+        }
+
+        List<SensorRecord> leaderRecords;
+        try {
+            RecordFile leaderRecordFile = new RecordFile(leaderFileName);
+            leaderRecords = leaderRecordFile.range(1, Long.MAX_VALUE);
+            System.out.println("1. Líder encontrado: " + leaderFileName + " (" + leaderRecords.size() + " registos)");
+        } catch (Exception e) {
+            System.out.println("[ERRO] Falha ao ler o ficheiro do líder: " + e.getMessage());
+            return;
+        }
+
+        // 2. Encontrar todos os ficheiros replica-*-p<k>.txt
+        File currentDir = new File(".");
+        File[] replicaFiles = currentDir.listFiles((dir, name) -> name.matches("replica-.*-p" + k + "\\.txt"));
+        if (replicaFiles == null) {
+            replicaFiles = new File[0];
+        }
+        Arrays.sort(replicaFiles, Comparator.comparing(File::getName));
+        System.out.println("2. Réplicas encontradas: " + replicaFiles.length);
+
+        // 3. Validar a sequência do líder e 4. Verificar se cada sensor pertence a k
+        long expectedSeq = 1;
+        boolean leaderSeqValid = true;
+        boolean sensorsValid = true;
+        Set<String> distinctSensors = new HashSet<>();
+
+        for (SensorRecord r : leaderRecords) {
+            if (r.getSeq() != expectedSeq) {
+                System.out.println("   [ERRO] Quebra de sequência no líder! Esperado: " + expectedSeq + ", Encontrado: " + r.getSeq());
+                leaderSeqValid = false;
+            }
+            expectedSeq = r.getSeq() + 1;
+
+            String sensor = r.getSensor();
+            distinctSensors.add(sensor);
+
+            int expectedPartition = partitioner.of(sensor);
+            if (expectedPartition != k) {
+                System.out.println("   [ERRO] Sensor '" + sensor + "' (seq " + r.getSeq() + ") pertence à partição p" + expectedPartition + ", mas está em p" + k);
+                sensorsValid = false;
+            }
+        }
+
+        if (leaderSeqValid) {
+            System.out.println("3. Sequência do líder: OK (1.." + leaderRecords.size() + ")");
+        }
+        if (sensorsValid) {
+            System.out.println("4. Particionamento de sensores: OK (" + distinctSensors.size() + " sensores distintos)");
+        }
+
+        // 5. Comparar cada réplica com o líder
+        int syncedReplicas = 0;
+        for (File repFile : replicaFiles) {
+            try {
+                RecordFile repRecordFile = new RecordFile(repFile.getName());
+                List<SensorRecord> repRecords = repRecordFile.range(1, Long.MAX_VALUE);
+
+                boolean sameSize = (repRecords.size() == leaderRecords.size());
+                boolean sameContent = true;
+                int limit = Math.min(repRecords.size(), leaderRecords.size());
+
+                for (int i = 0; i < limit; i++) {
+                    if (!repRecords.get(i).toLine().equals(leaderRecords.get(i).toLine())) {
+                        sameContent = false;
+                        System.out.println("   [ERRO] Divergência em " + repFile.getName() + " na posição " + (i + 1) +
+                                " (esperado: " + leaderRecords.get(i).toLine() + ", encontrado: " + repRecords.get(i).toLine() + ")");
+                        break;
+                    }
+                }
+
+                if (sameSize && sameContent) {
+                    syncedReplicas++;
+                    System.out.println("5. Réplica " + repFile.getName() + ": OK (" + repRecords.size() + " registos)");
+                } else if (!sameSize && sameContent) {
+                    System.out.println("5. Réplica " + repFile.getName() + ": INCOMPLETA/DIFERENTE (" + repRecords.size() + "/" + leaderRecords.size() + " registos)");
+                } else {
+                    System.out.println("5. Réplica " + repFile.getName() + ": DIVERGENTE (" + repRecords.size() + " registos)");
+                }
+            } catch (Exception e) {
+                System.out.println("5. Erro ao ler réplica " + repFile.getName() + ": " + e.getMessage());
+            }
+        }
+
+        // 6. Contar registos, sensores distintos e réplicas
+        System.out.println("\n--- Resumo Final (p" + k + ") ---");
+        System.out.println("Registos no líder: " + leaderRecords.size());
+        System.out.println("Sensores distintos: " + distinctSensors.size());
+        System.out.println("Réplicas sincronizadas: " + syncedReplicas + "/" + replicaFiles.length);
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\Partitioner.java ===
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\PartitionReplica.java ===
+package rep02;
+
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.TreeMap;
+
+public class PartitionReplica {
+    private final String replicaId;
+    private final int k;
+    private final RecordFile file;
+    private long seq;
+
+    private String leaderHost = null;
+    private int leaderPort = -1;
+    private final TreeMap<Long, SensorRecord> buffered = new TreeMap<>();
+    private boolean recovering = false;
+
+    public PartitionReplica(String replicaId, int k, String api) throws Exception {
+        this.replicaId = replicaId;
+        this.k = k;
+        
+        this.file = new RecordFile("replica-" + replicaId + "-p" + k + ".txt");
+        this.seq = file.lastSeq();
+
+        IpfsPubSub pubsub = new IpfsPubSub(api);
+
+        System.out.println("Réplica " + replicaId + " (p" + k + ") iniciada. Último seq local: " + seq);
+
+        new Thread(this::initialRecovery).start();
+
+        pubsub.subscribe(Wire.topicData(k), msg -> {
+            try {
+                String trimmed = msg != null ? msg.trim() : "";
+                if (!trimmed.startsWith("REG")) {
+                    System.out.println("REJEITADO; Mensagem inválida: " + trimmed);
+                    return;
+                }
+
+                String[] parts = trimmed.split(";", 4);
+                if (parts.length < 4) {
+                    System.out.println("REJEITADO; Formato REG incompleto: " + trimmed);
+                    return;
+                }
+
+                String host = parts[1];
+                int port;
+                try {
+                    port = Integer.parseInt(parts[2]);
+                } catch (NumberFormatException e) {
+                    System.out.println("REJEITADO; Porto inválido no REG: " + trimmed);
+                    return;
+                }
+
+                synchronized (this) {
+                    leaderHost = host;
+                    leaderPort = port;
+                }
+
+                SensorRecord r;
+                try {
+                    r = SensorRecord.fromLine(parts[3]);
+                } catch (Exception e) {
+                    System.out.println("REJEITADO; Registo de sensor corrompido: " + trimmed);
+                    return;
+                }
+
+                long rSeq = r.getSeq();
+
+                synchronized (this) {
+                    if (rSeq <= seq) {
+                        System.out.println("DUPLICADO; Registo " + rSeq + " já processado.");
+                        return;
+                    }
+
+                    if (rSeq == seq + 1) {
+                        file.append(r);
+                        seq = r.getSeq();
+                        System.out.println("p" + k + " Sincronizado (REG): " + r.toLine());
+
+                        while (buffered.containsKey(seq + 1)) {
+                            SensorRecord nextR = buffered.remove(seq + 1);
+                            file.append(nextR);
+                            seq = nextR.getSeq();
+                            System.out.println("p" + k + " Sincronizado (Buffer): " + nextR.toLine());
+                        }
+                    } else {
+                        if (!buffered.containsKey(rSeq)) {
+                            buffered.put(rSeq, r);
+                            System.out.println("EM ESPERA; Retido seq " + rSeq + ". Total retidos: " + buffered.size());
+                        }
+
+                        // Chamada direta e síncrona na thread de subscrição quando ultrapassa 10 retidos[cite: 10]
+                        if (buffered.size() > 10) {
+                            recoverFromLeader();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("REJEITADO; Erro ao processar dados: " + e.getMessage());
+            }
+        });
+    }
+
+    private void initialRecovery() {
+        int tentativas = 0;
+        while (leaderPort == -1 && tentativas < 5) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException ignored) {}
+            tentativas++;
+        }
+        if (leaderPort != -1) {
+            recoverFromLeader();
+        }
+    }
+
+    private void recoverFromLeader() {
+        synchronized (this) {
+            if (recovering) return;
+            if (leaderPort == -1 || leaderHost == null) return;
+            recovering = true;
+        }
+
+        long from;
+        long to;
+        String host;
+        int port;
+
+        synchronized (this) {
+            from = seq + 1;
+            if (buffered.isEmpty()) {
+                to = seq + 5000; 
+            } else {
+                to = buffered.firstKey() - 1;
+            }
+
+            if (from > to) {
+                synchronized (this) {
+                    recovering = false;
+                }
+                return;
+            }
+
+            host = leaderHost;
+            port = leaderPort;
+        }
+
+        System.out.println("RECUPERAÇÃO: " + from + ".." + to + " pedida a " + host + ":" + port);
+
+        try (Socket socket = new Socket(host, port);
+             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+             PrintWriter out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true)) {
+
+            socket.setSoTimeout(Wire.T_TCP_MS);
+            out.println("PEDIDO " + from + " " + to);
+
+            String line;
+            boolean receivedFim = false;
+            while ((line = in.readLine()) != null) {
+                line = line.trim();
+                if (line.equals("FIM")) {
+                    receivedFim = true;
+                    break;
+                }
+                if (line.startsWith("ERRO")) {
+                    System.out.println("Líder rejeitou recuperação: " + line);
+                    break;
+                }
+
+                SensorRecord r = SensorRecord.fromLine(line);
+                synchronized (this) {
+                    if (r.getSeq() > seq) {
+                        file.append(r);
+                        seq = r.getSeq();
+                        buffered.remove(seq);
+                        // Mensagem exata exigida pela ficha[cite: 10]
+                        System.out.println("RECUPERADO: " + seq);
+                        System.out.println("p" + k + " Recuperado TCP: " + r.toLine());
+                    }
+                }
+            }
+
+            if (!receivedFim) {
+                System.out.println("Aviso: Recuperação TCP incompleta (sem FIM). Estado retido mantido em memória.");
+            } else {
+                synchronized (this) {
+                    while (buffered.containsKey(seq + 1)) {
+                        SensorRecord nextR = buffered.remove(seq + 1);
+                        file.append(nextR);
+                        seq = nextR.getSeq();
+                        System.out.println("p" + k + " Sincronizado pós-TCP (Buffer): " + nextR.toLine());
+                    }
+                }
+            }
+
+        } catch (IOException e) {
+            System.out.println("Aviso: Falha na ligação TCP para recuperação (" + e.getMessage() + "). Estado retido mantido.");
+        } finally {
+            synchronized (this) {
+                recovering = false;
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("Erro: Argumentos insuficientes.");
+            System.out.println("Uso: java rep02.PartitionReplica <id> <partição(ões)> [api]");
+            return;
+        }
+
+        String replicaId = args[0];
+        String partitionsArg = args[1];
+        String api = args.length > 2 ? args[2] : "http://127.0.0.1:5001/api/v0";
+
+        String[] parts = partitionsArg.split(",");
+        for (String pStr : parts) {
+            try {
+                int k = Integer.parseInt(pStr.trim());
+                new Thread(() -> {
+                    try {
+                        new PartitionReplica(replicaId, k, api);
+                    } catch (Exception e) {
+                        System.out.println("Erro crítico na réplica p" + k + ": " + e.getMessage());
+                    }
+                }).start();
+            } catch (NumberFormatException e) {
+                System.out.println("Erro: Identificador de partição inválido: " + pStr);
+            }
+        }
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\RecordFile.java ===
+package rep02;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.ArrayList;
+import java.util.List;
+
+
+
+public class RecordFile {
+    private final Path path;
+
+    public RecordFile(String fileName) {
+        this.path = Paths.get(fileName);
+    }
+
+    public synchronized List<SensorRecord> range(long from, long to) throws IOException {
+        List<SensorRecord> out = new ArrayList<>();
+        if (!Files.exists(path)) {
+            return out;
+        }
+        for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+            if (line.isBlank()) {
+                continue;
+            }
+            SensorRecord r = SensorRecord.fromLine(line);
+            if (r.getSeq() >= from && r.getSeq() <= to) {
+                out.add(r);
+            }
+        }
+        return out;
+    }
+
+    // acrescenta uma linha ao fim do ficheiro (cria-o se não existir)
+    public synchronized void append(SensorRecord r) throws IOException {
+        Files.writeString(path, r.toLine() + System.lineSeparator(), StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+
+    // número de sequência do último registo guardado (0 se o ficheiro não existir)
+    public synchronized long lastSeq() throws IOException {
+        if (!Files.exists(path)) {
+            return 0;
+        }
+        long last = 0;
+        for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+            if (!line.isBlank()) {
+                last = SensorRecord.fromLine(line).getSeq();
+            }
+        }
+        return last;
+    }
+}
+
+
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\SensorRecord.java ===
+package rep02;
+
+import java.time.LocalDateTime;
+
+public class SensorRecord {
+    private final long seq;
+    private final String sensorId;
+    private final double temperature;
+    private final String timestamp;
+
+    public SensorRecord(long seq, String sensorId, double temperature, String timestamp) {
+        this.seq = seq;
+        this.sensorId = sensorId;
+        this.temperature = temperature;
+        this.timestamp = timestamp;
+    }
+
+    public static SensorRecord now(long seq, String sensorId, double temperature) {
+        return new SensorRecord(seq, sensorId, temperature, LocalDateTime.now().withNano(0).toString());
+    }
+
+    public String toLine() {
+        return seq + ";" + sensorId + ";" + temperature + ";" + timestamp;
+    }
+
+    public static SensorRecord fromLine(String line) {
+        String[] f = line.trim().split(";");
+        if (f.length != 4) {
+            throw new IllegalArgumentException("Registo mal formado: " + line);
+        }
+        return new SensorRecord(Long.parseLong(f[0]), f[1], Double.parseDouble(f[2]), f[3]);
+    }
+
+    public long getSeq() { return seq; }
+    public String getSensorId() { return sensorId; }
+    public double getTemperature() { return temperature; }
+    public String getTimestamp() { return timestamp; }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\rep02-replica\src\rep02\Wire.java ===
+package rep02;
+
+public final class Wire {
+    public static final int LIMITE_RETIDOS = 10;   // acima deste número de retidos, a réplica recupera
+    public static final int T_TCP_MS = 5000;       // tempo máximo de ligação e de espera por cada linha
+    public static final int PORTO_BASE = 7000;     // porto de recuperação do líder da partição k: 7000 + k
+
+    private Wire() { }
+
+    public static String topicIn(int k)   { return "rep02-in-p" + k; }
+    public static String topicData(int k) { return "rep02-p" + k; }
+
+    public static String in(String sensor, double temp) { return "IN;" + sensor + ";" + temp; }
+
+    // REG;<endereço>;<porto>;<seq>;<sensor>;<temperatura>;<instante>
+    public static String reg(String host, int port, SensorRecord r) {
+        return "REG;" + host + ";" + port + ";" + r.toLine();
+    }
+
+    // tipo da mensagem (IN, REG); lança IllegalArgumentException se não houver tipo
+    public static String type(String msg) {
+        String m = msg.trim();
+        int i = m.indexOf(';');
+        if (i <= 0) {
+            throw new IllegalArgumentException("Mensagem sem tipo: " + msg);
+        }
+        return m.substring(0, i);
+    }
+
+    // conteúdo da mensagem sem o tipo
+    public static String body(String msg) {
+        String m = msg.trim();
+        return m.substring(m.indexOf(';') + 1);
+    }
+
+    // divide uma mensagem REG em { endereço, porto, linha do registo }
+    public static String[] regParts(String msg) {
+        String[] f = msg.trim().split(";", 4);
+        if (f.length != 4 || !f[0].equals("REG")) {
+            throw new IllegalArgumentException("REG mal formado: " + msg);
+        }
+        return new String[] { f[1], f[2], f[3] };
+    }
+}
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\Arquitetura COMINDIR02.html ===
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Arquitetura COMINDIR02</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Instrument+Sans:wght@500;600;700&display=swap">
+<style>
+/* Layout: coluna de leitura técnica, diagrama largo no topo, fichas de classe em grelha; cada partição tem a sua cor */
+:root{
+  --bg:#f5f7f8; --surface:#ffffff; --fg:#17212b; --muted:#5a6773; --line:#d6dde3; --code-bg:#eef2f5;
+  --accent:#0f5f7a;
+  --p0:#2b6cb0; --p1:#b7791f; --p2:#2f855a; --tcp:#c53030;
+  --p0-soft:#e3edf8; --p1-soft:#f8eedd; --p2-soft:#e2f2e8; --tcp-soft:#fbe4e4;
+  --f-display:"Instrument Sans",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#11171c; --surface:#182129; --fg:#e4eaef; --muted:#97a5b1; --line:#2c3a45; --code-bg:#1e2a33;
+  --accent:#5fb4d1; --p0:#6aa7e8; --p1:#e0aa52; --p2:#63c08c; --tcp:#f07272;
+  --p0-soft:#1c2c3f; --p1-soft:#33291a; --p2-soft:#1a3226; --tcp-soft:#3a1f22; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#11171c; --surface:#182129; --fg:#e4eaef; --muted:#97a5b1; --line:#2c3a45; --code-bg:#1e2a33;
+  --accent:#5fb4d1; --p0:#6aa7e8; --p1:#e0aa52; --p2:#63c08c; --tcp:#f07272;
+  --p0-soft:#1c2c3f; --p1-soft:#33291a; --p2-soft:#1a3226; --tcp-soft:#3a1f22; color-scheme:dark}
+
+body{background:var(--bg);color:var(--fg);font-family:var(--f-body);font-size:15px;line-height:1.6;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:32px 64px}
+.wrap{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:48px}
+h1,h2,h3{font-family:var(--f-display);text-wrap:balance;margin:0;line-height:1.2}
+h1{font-size:clamp(28px,4vw,38px);font-weight:700}
+h2{font-size:23px;font-weight:600;display:flex;gap:10px;align-items:baseline}
+h2 .n{font-family:var(--f-mono);font-size:13px;color:var(--accent);font-weight:500}
+h3{font-size:17px;font-weight:600}
+p{margin:0;max-width:72ch}
+section{display:flex;flex-direction:column;gap:16px}
+code,.mono{font-family:var(--f-mono);font-size:.88em}
+code{background:var(--code-bg);padding:1px 5px;border-radius:4px}
+.eyebrow{font-family:var(--f-mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+header{display:flex;flex-direction:column;gap:12px}
+.lede{font-size:17px;color:var(--muted);max-width:68ch}
+
+.params{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.params div{background:var(--surface);padding:12px 14px;display:flex;flex-direction:column;gap:2px}
+.params b{font-family:var(--f-mono);font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+.params span{font-size:12.5px;color:var(--muted)}
+
+.diagram{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow-x:auto;padding:12px}
+.diagram svg{display:block;min-width:820px;width:100%;height:auto}
+.legend{display:flex;flex-wrap:wrap;gap:16px;font-size:13px;color:var(--muted)}
+.legend i{display:inline-block;width:22px;height:0;border-top:3px solid;vertical-align:middle;margin-right:6px}
+figcaption{font-size:13.5px;color:var(--muted);max-width:80ch}
+figure{margin:0;display:flex;flex-direction:column;gap:12px}
+
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:var(--f-mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;background:var(--code-bg)}
+tr:last-child td{border-bottom:0}
+
+.roles{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+.role{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.role .proj{font-family:var(--f-mono);font-size:12px;color:var(--accent)}
+.role dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:13.5px}
+.role dt{color:var(--muted)}
+.role dd{margin:0}
+
+.projects{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.project{border:1px dashed var(--line);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:8px}
+.project h3{font-family:var(--f-mono);font-size:14px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-family:var(--f-mono);font-size:12.5px;padding:3px 8px;border-radius:999px;border:1px solid var(--line);background:var(--surface)}
+.chip.new{border-color:var(--accent);color:var(--accent)}
+.chip.mod{border-style:dashed}
+
+.classes{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}
+.cls{background:var(--surface);border:1px solid var(--line);border-radius:8px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.cls .hd{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex-wrap:wrap}
+.cls .hd b{font-family:var(--f-mono);font-size:15px}
+.cls .hd span{font-size:12px;color:var(--muted)}
+.cls .bd{padding:12px 14px;display:flex;flex-direction:column;gap:10px;font-size:13.5px}
+.cls ul{margin:0;padding-left:0;list-style:none;display:flex;flex-direction:column;gap:3px;font-family:var(--f-mono);font-size:12.5px}
+.cls ul li{overflow-wrap:anywhere}
+.cls .lbl{font-family:var(--f-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.tag{font-family:var(--f-mono);font-size:11px;padding:1px 6px;border-radius:4px;background:var(--code-bg);color:var(--muted)}
+
+.threads{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.lane{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.th{border-left:3px solid var(--accent);padding:4px 0 4px 10px;font-size:13.5px}
+.th b{font-family:var(--f-mono);font-size:13px}
+.shared{background:var(--tcp-soft);border-radius:6px;padding:10px 12px;font-size:13.5px}
+
+.rules{display:flex;flex-direction:column;gap:8px}
+.rule{display:grid;grid-template-columns:minmax(150px,220px) 1fr;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:14px}
+.rule .cond{font-family:var(--f-mono);font-size:13px;font-weight:600}
+@media (max-width:560px){.rule{grid-template-columns:1fr;gap:4px}}
+.rule.r-ok .cond{color:var(--p2)} .rule.r-dup .cond{color:var(--muted)} .rule.r-hold .cond{color:var(--p1)} .rule.r-fail .cond{color:var(--tcp)}
+
+pre.mermaid{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;overflow-x:auto;margin:0}
+.note{font-size:13.5px;color:var(--muted);border-left:3px solid var(--line);padding-left:12px;max-width:72ch}
+.limits{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px;max-width:75ch}
+</style>
+
+<div class="wrap">
+<header>
+  <span class="eyebrow">Sistemas Distribuídos · ESTGV · Ficha prática COMINDIR02</span>
+  <h1>Particionamento e recuperação de registos com Publish/Subscribe</h1>
+  <p class="lede">O presente documento descreve a arquitetura do sistema especificado na ficha COMINDIR02. Identificam-se os processos que o compõem, o papel atribuído a cada um, os canais de comunicação e os respetivos formatos de mensagem, a organização das classes por projeto e as atividades concorrentes que partilham estado. A designação das classes, tópicos, portos e formatos segue o enunciado; os atributos e métodos auxiliares constituem uma proposta de concretização.</p>
+</header>
+
+<section>
+  <h2><span class="n">1</span>Parâmetros do sistema</h2>
+  <div class="params">
+    <div><b>N = 3</b><span>número de partições (Parte A: N = 1)</span></div>
+    <div><b>R = 2</b><span>fator de replicação</span></div>
+    <div><b>10</b><span><code>LIMITE_RETIDOS</code>: limiar de deteção de perda</span></div>
+    <div><b>7000 + k</b><span>porto de recuperação do líder da partição k</span></div>
+    <div><b>5000 ms</b><span><code>T_TCP_MS</code>: tempo máximo de ligação e de leitura</span></div>
+    <div><b>floorMod</b><span>função de partição sobre <code>hashCode(sensor)</code></span></div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">2</span>Visão geral da arquitetura</h2>
+  <p>O fluxo de dados organiza-se em três troços. O <b>produtor</b> determina a partição de cada leitura a partir da chave de partição (o identificador do sensor) e publica-a no tópico de entrada correspondente. O <b>líder</b> da partição atribui-lhe um número de sequência, regista-a no seu ficheiro local e, em seguida, propaga-a no tópico de dados. As <b>réplicas</b> responsáveis por essa partição aplicam os registos segundo a ordem definida pelo líder. A recuperação de registos perdidos constitui a única interação fora do PubSub: realiza-se por comunicação direta, através de uma ligação TCP da réplica para o endereço e porto anunciados pelo líder na mensagem <code>REG</code> mais recente.</p>
+  <figure>
+  <div class="diagram">
+  <svg viewBox="0 0 1010 570" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Figura 1: arquitetura do sistema com três partições e fator de replicação dois, incluindo a recuperação por TCP">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker>
+      <marker id="art" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--tcp)"/></marker>
+    </defs>
+    <g font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">
+      <text x="85" y="22" text-anchor="middle">Produção</text>
+      <text x="280" y="22" text-anchor="middle">Tópicos de entrada</text>
+      <text x="500" y="22" text-anchor="middle">Líderes de partição</text>
+      <text x="720" y="22" text-anchor="middle">Tópicos de dados</text>
+      <text x="920" y="22" text-anchor="middle">Réplicas (R = 2)</text>
+    </g>
+
+    <g fill="none" stroke-width="2">
+      <path d="M150,280 C180,280 180,110 210,110" stroke="var(--p0)" marker-end="url(#ar)"/>
+      <path d="M150,280 L210,280" stroke="var(--p1)" marker-end="url(#ar)"/>
+      <path d="M150,280 C180,280 180,450 210,450" stroke="var(--p2)" marker-end="url(#ar)"/>
+      <path d="M350,110 L410,110" stroke="var(--p0)" marker-end="url(#ar)"/>
+      <path d="M350,280 L410,280" stroke="var(--p1)" marker-end="url(#ar)"/>
+      <path d="M350,450 L410,450" stroke="var(--p2)" marker-end="url(#ar)"/>
+      <path d="M590,110 L650,110" stroke="var(--p0)" marker-end="url(#ar)"/>
+      <path d="M590,280 L650,280" stroke="var(--p1)" marker-end="url(#ar)"/>
+      <path d="M590,450 L650,450" stroke="var(--p2)" marker-end="url(#ar)"/>
+      <path d="M790,100 L850,100" stroke="var(--p0)" marker-end="url(#ar)"/>
+      <path d="M790,120 C825,120 815,440 850,440" stroke="var(--p0)" marker-end="url(#ar)"/>
+      <path d="M790,270 C820,270 820,122 850,122" stroke="var(--p1)" marker-end="url(#ar)"/>
+      <path d="M790,282 L850,282" stroke="var(--p1)" marker-end="url(#ar)"/>
+      <path d="M790,440 C820,440 820,300 850,300" stroke="var(--p2)" marker-end="url(#ar)"/>
+      <path d="M790,460 L850,460" stroke="var(--p2)" marker-end="url(#ar)"/>
+      <path d="M915,495 C915,550 520,560 520,507" stroke="var(--tcp)" stroke-dasharray="6 5" marker-end="url(#art)"/>
+    </g>
+    <text x="720" y="552" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--tcp)">Pedido de recuperação (TCP, porto 7002): PEDIDO → registos → FIM</text>
+
+    <rect x="20" y="235" width="130" height="90" rx="8" fill="var(--surface)" stroke="var(--fg)" stroke-width="1.5"/>
+    <text x="85" y="264" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="15" fill="var(--fg)">Produtor</text>
+    <text x="85" y="284" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">função de partição</text>
+    <text x="85" y="300" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">k = of(sensor)</text>
+
+    <g font-family="IBM Plex Mono, monospace" font-size="11.5">
+      <rect x="210" y="90" width="140" height="40" rx="20" fill="var(--p0-soft)" stroke="var(--p0)"/>
+      <text x="280" y="114" text-anchor="middle" fill="var(--fg)">rep02-in-p0</text>
+      <rect x="210" y="260" width="140" height="40" rx="20" fill="var(--p1-soft)" stroke="var(--p1)"/>
+      <text x="280" y="284" text-anchor="middle" fill="var(--fg)">rep02-in-p1</text>
+      <rect x="210" y="430" width="140" height="40" rx="20" fill="var(--p2-soft)" stroke="var(--p2)"/>
+      <text x="280" y="454" text-anchor="middle" fill="var(--fg)">rep02-in-p2</text>
+    </g>
+    <text x="280" y="160" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--muted)">mensagens IN</text>
+
+    <g>
+      <rect x="410" y="58" width="180" height="104" rx="8" fill="var(--surface)" stroke="var(--p0)" stroke-width="2"/>
+      <text x="500" y="84" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="14" fill="var(--fg)">Líder da partição 0</text>
+      <text x="500" y="104" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">sequência própria · lider-p0.txt</text>
+      <text x="500" y="122" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">servidor de recuperação :7000</text>
+      <text x="500" y="146" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--p0)">atividade de entrada ∥ servidor TCP</text>
+
+      <rect x="410" y="228" width="180" height="104" rx="8" fill="var(--surface)" stroke="var(--p1)" stroke-width="2"/>
+      <text x="500" y="254" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="14" fill="var(--fg)">Líder da partição 1</text>
+      <text x="500" y="274" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">sequência própria · lider-p1.txt</text>
+      <text x="500" y="292" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">servidor de recuperação :7001</text>
+      <text x="500" y="316" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--p1)">atividade de entrada ∥ servidor TCP</text>
+
+      <rect x="410" y="398" width="180" height="104" rx="8" fill="var(--surface)" stroke="var(--p2)" stroke-width="2"/>
+      <text x="500" y="424" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="14" fill="var(--fg)">Líder da partição 2</text>
+      <text x="500" y="444" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">sequência própria · lider-p2.txt</text>
+      <text x="500" y="462" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">servidor de recuperação :7002</text>
+      <text x="500" y="486" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--p2)">atividade de entrada ∥ servidor TCP</text>
+    </g>
+
+    <g font-family="IBM Plex Mono, monospace" font-size="11.5">
+      <rect x="650" y="90" width="140" height="40" rx="20" fill="var(--p0-soft)" stroke="var(--p0)"/>
+      <text x="720" y="114" text-anchor="middle" fill="var(--fg)">rep02-p0</text>
+      <rect x="650" y="260" width="140" height="40" rx="20" fill="var(--p1-soft)" stroke="var(--p1)"/>
+      <text x="720" y="284" text-anchor="middle" fill="var(--fg)">rep02-p1</text>
+      <rect x="650" y="430" width="140" height="40" rx="20" fill="var(--p2-soft)" stroke="var(--p2)"/>
+      <text x="720" y="454" text-anchor="middle" fill="var(--fg)">rep02-p2</text>
+    </g>
+    <text x="720" y="160" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--muted)">mensagens REG (com endereço e porto)</text>
+
+    <g>
+      <rect x="850" y="72" width="140" height="70" rx="8" fill="var(--surface)" stroke="var(--fg)" stroke-width="1.5"/>
+      <text x="920" y="98" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="14" fill="var(--fg)">Réplica 1</text>
+      <text x="920" y="120" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">partições p0, p1</text>
+
+      <rect x="850" y="255" width="140" height="70" rx="8" fill="var(--surface)" stroke="var(--fg)" stroke-width="1.5"/>
+      <text x="920" y="281" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="14" fill="var(--fg)">Réplica 2</text>
+      <text x="920" y="303" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">partições p1, p2</text>
+
+      <rect x="850" y="425" width="140" height="70" rx="8" fill="var(--surface)" stroke="var(--fg)" stroke-width="1.5"/>
+      <text x="920" y="451" text-anchor="middle" font-family="Instrument Sans, sans-serif" font-weight="600" font-size="14" fill="var(--fg)">Réplica 3</text>
+      <text x="920" y="473" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">partições p2, p0</text>
+    </g>
+  </svg>
+  </div>
+  <div class="legend">
+    <span><i style="border-color:var(--p0)"></i>partição 0</span>
+    <span><i style="border-color:var(--p1)"></i>partição 1</span>
+    <span><i style="border-color:var(--p2)"></i>partição 2</span>
+    <span><i style="border-color:var(--tcp);border-top-style:dashed"></i>comunicação direta para recuperação</span>
+  </div>
+  <figcaption><b>Figura 1.</b> Arquitetura do sistema com N = 3 partições e fator de replicação R = 2. As setas contínuas representam comunicação indireta através do PubSub do IPFS; a seta tracejada exemplifica um pedido de recuperação da réplica 3 ao líder da partição 2.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="n">3</span>Papéis e conhecimento mútuo dos processos</h2>
+  <p>A caracterização de cada papel assenta no conhecimento que o processo detém sobre os restantes. Nos troços mediados pelo PubSub preserva-se o desacoplamento no espaço; apenas o mecanismo de recuperação o abandona, introduzindo acoplamento no espaço e no tempo entre a réplica e o líder.</p>
+  <div class="roles">
+    <div class="role">
+      <span class="proj">rep02-produtor · Producer</span>
+      <h3>Produtor</h3>
+      <p>Constitui o ponto de entrada das leituras no sistema. Determina a partição de cada leitura através da chave de partição e publica a mensagem <code>IN</code> no tópico de entrada respetivo.</p>
+      <dl><dt>Conhece</dt><dd>o número de partições e a função de partição</dd><dt>Desconhece</dt><dd>a identidade dos líderes e das réplicas</dd><dt>Limitação</dt><dd>não numera as leituras; uma perda neste troço não é detetável</dd></dl>
+    </div>
+    <div class="role">
+      <span class="proj">rep02-lider · PartitionLeader</span>
+      <h3>Líder da partição k</h3>
+      <p>Define a ordem dos registos da partição k. Atribui o número de sequência, escreve o registo localmente e só depois o propaga. O ficheiro local constitui a fonte da recuperação.</p>
+      <dl><dt>Conhece</dt><dd>k, N, o endereço anunciado e o porto de recuperação</dd><dt>Desconhece</dt><dd>o número e a identidade das réplicas</dd><dt>Verifica</dt><dd>que <code>of(sensor) == k</code>; caso contrário, rejeita a leitura</dd></dl>
+    </div>
+    <div class="role">
+      <span class="proj">rep02-replica · PartitionReplica</span>
+      <h3>Réplica n</h3>
+      <p>Mantém as partições que lhe foram atribuídas, cada uma num ficheiro próprio. Aplica os registos por ordem, retém em memória os que chegam antecipadamente e solicita ao líder os que considera perdidos.</p>
+      <dl><dt>Conhece</dt><dd>o seu identificador e as partições atribuídas</dd><dt>Obtém</dt><dd>o endereço e o porto do líder a partir de cada <code>REG</code></dd><dt>Decide</dt><dd>que um registo se perdeu quando os retidos excedem 10</dd></dl>
+    </div>
+    <div class="role">
+      <span class="proj">rep02-replica · PartitionCheck</span>
+      <h3>Verificador</h3>
+      <p>Ferramenta de análise a posteriori. Lê os ficheiros <code>lider-p*.txt</code> e <code>replica-*-p*.txt</code> e verifica a correção da partição, a continuidade das sequências, o número de réplicas por partição e a relação de igualdade ou de prefixo com o ficheiro do líder.</p>
+      <dl><dt>Execução</dt><dd>no final de cada ensaio</dd><dt>Comunicação</dt><dd>nenhuma; opera apenas sobre ficheiros</dd></dl>
+    </div>
+    <div class="role">
+      <span class="proj">executável ipfs (Kubo)</span>
+      <h3>Daemon IPFS</h3>
+      <p>Intermediário da comunicação indireta, acedido pela API HTTP (<code>/api/v0</code>, porto 5001) através da classe <code>IpfsPubSub</code>. Oferece entrega <em>best-effort</em>, sujeita a perdas e a reordenação.</p>
+      <dl><dt>Assegura</dt><dd>desacoplamento no espaço e no tempo</dd><dt>Não assegura</dt><dd>entrega nem ordem</dd></dl>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">4</span>Canais de comunicação e formato das mensagens</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Canal</th><th>Formato</th><th>Emissor</th><th>Recetor</th><th>Modalidade</th></tr></thead>
+    <tbody>
+      <tr><td><code>rep02-in-p&lt;k&gt;</code></td><td><code>IN;&lt;sensor&gt;;&lt;temp&gt;</code></td><td>produtor(es)</td><td>líder da partição k</td><td>indireta (PubSub)</td></tr>
+      <tr><td><code>rep02-p&lt;k&gt;</code></td><td><code>REG;&lt;host&gt;;&lt;porto&gt;;&lt;seq&gt;;&lt;sensor&gt;;&lt;temp&gt;;&lt;instante&gt;</code></td><td>líder da partição k</td><td>réplicas da partição k</td><td>indireta (PubSub)</td></tr>
+      <tr><td>TCP, porto <code>7000+k</code></td><td><code>PEDIDO &lt;de&gt; &lt;até&gt;</code></td><td>réplica</td><td>líder da partição k</td><td>direta</td></tr>
+      <tr><td>TCP, porto <code>7000+k</code></td><td><code>&lt;seq&gt;;&lt;sensor&gt;;&lt;temp&gt;;&lt;instante&gt;</code> (0 a n linhas), seguido de <code>FIM</code></td><td>líder da partição k</td><td>réplica</td><td>direta</td></tr>
+      <tr><td>TCP, porto <code>7000+k</code></td><td><code>ERRO &lt;motivo&gt;</code> (pedido mal formado ou <i>de</i> &gt; <i>até</i>)</td><td>líder da partição k</td><td>réplica</td><td>direta</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">O líder limita o extremo <i>até</i> ao último número de sequência escrito. As linhas da resposta adotam o formato dos ficheiros (<code>SensorRecord.toLine()</code>), pelo que podem ser interpretadas com <code>SensorRecord.fromLine</code>.</p>
+</section>
+
+<section>
+  <h2><span class="n">5</span>Organização em projetos e classes</h2>
+  <p>O sistema distribui-se por três projetos, que simulam máquinas distintas; todas as classes pertencem ao pacote <code>rep02</code>. As classes herdadas da COMINDIR01 são copiadas sem alteração além do pacote, exceto <code>RecordFile</code>, que recebe o método <code>range</code>.</p>
+  <div class="projects">
+    <div class="project"><h3>rep02-produtor</h3><div class="chips">
+      <span class="chip">SensorRecord</span><span class="chip">RecordFile</span><span class="chip">IpfsPubSub</span><span class="chip new">Wire</span><span class="chip new">Partitioner</span><span class="chip new">Producer</span></div></div>
+    <div class="project"><h3>rep02-lider</h3><div class="chips">
+      <span class="chip">SensorRecord</span><span class="chip mod">RecordFile + range</span><span class="chip">IpfsPubSub</span><span class="chip new">Wire</span><span class="chip new">Partitioner</span><span class="chip new">PartitionLeader</span></div></div>
+    <div class="project"><h3>rep02-replica</h3><div class="chips">
+      <span class="chip">SensorRecord</span><span class="chip mod">RecordFile + range</span><span class="chip">IpfsPubSub</span><span class="chip new">Wire</span><span class="chip new">Partitioner</span><span class="chip new">PartitionReplica</span><span class="chip new">PartitionCheck</span></div></div>
+  </div>
+  <div class="legend"><span><span class="chip">x</span> herdada da COMINDIR01</span><span><span class="chip mod">x</span> herdada e estendida</span><span><span class="chip new">x</span> introduzida nesta ficha</span></div>
+
+  <div class="classes">
+    <div class="cls"><div class="hd"><b>SensorRecord</b><span>modelo de dados · COMINDIR01</span></div><div class="bd">
+      <p>Representa um registo imutável no formato <code>seq;sensor;temperatura;instante</code>.</p>
+      <div class="lbl">Operações relevantes</div><ul><li>toLine(): serialização para ficheiro e resposta TCP</li><li>fromLine(String): interpretação de ficheiro, REG e resposta TCP</li><li>getSeq()</li></ul></div></div>
+
+    <div class="cls"><div class="hd"><b>RecordFile</b><span>persistência · estendida</span></div><div class="bd">
+      <p>Encapsula um ficheiro de registos. Os métodos são <code>synchronized</code>, o que impede que uma leitura por <code>range</code> ocorra durante um <code>append</code>.</p>
+      <ul><li>append(SensorRecord)</li><li>lastSeq(): valor inicial da sequência no líder e na réplica</li><li><b>range(from, to)</b>: List&lt;SensorRecord&gt; <span class="tag">novo</span></li></ul>
+      <p class="note">O método range percorre o ficheiro completo; o custo de cada pedido é linear no tamanho do histórico.</p></div></div>
+
+    <div class="cls"><div class="hd"><b>IpfsPubSub</b><span>comunicação indireta · COMINDIR01</span></div><div class="bd">
+      <p>Cliente da API HTTP do Kubo, implementado com <code>java.net.http.HttpClient</code>.</p>
+      <ul><li>publish(topic, msg)</li><li>subscribe(topic, handler): operação bloqueante</li></ul>
+      <p class="note">Por ser bloqueante, cada subscrição exige uma thread dedicada.</p></div></div>
+
+    <div class="cls"><div class="hd"><b>Wire</b><span>protocolo · fornecida</span></div><div class="bd">
+      <p>Centraliza os nomes dos tópicos, as constantes do mecanismo de recuperação e o formato das mensagens, assegurando a coerência entre os três projetos.</p>
+      <ul><li>LIMITE_RETIDOS = 10, T_TCP_MS = 5000, PORTO_BASE = 7000</li><li>topicIn(k), topicData(k)</li><li>in(sensor, temp), reg(host, port, r)</li><li>type(msg), body(msg), regParts(msg): {host, porto, linha}</li></ul></div></div>
+
+    <div class="cls"><div class="hd"><b>Partitioner</b><span>particionamento · fornecida</span></div><div class="bd">
+      <p>Implementa a função de partição. É determinística em qualquer JVM, uma vez que o resultado de <code>String.hashCode()</code> está fixado pela especificação da linguagem.</p>
+      <ul><li>Partitioner(int n)</li><li>of(sensorId) = floorMod(hashCode, n)</li><li>count()</li></ul>
+      <p class="note">Utiliza-se floorMod em vez do operador %, que produziria um valor negativo para um hashCode negativo.</p></div></div>
+
+    <div class="cls"><div class="hd"><b>Producer</b><span>ponto de entrada · rep02-produtor</span></div><div class="bd">
+      <p>Invocação: <code>Producer &lt;N&gt; [api]</code>. Interpreta comandos da consola e publica <code>IN</code> em <code>topicIn(of(sensor))</code>, indicando a partição de destino.</p>
+      <div class="lbl">Comandos</div>
+      <ul><li>&lt;sensor&gt; &lt;temperatura&gt;</li><li>rajada &lt;n&gt; &lt;s&gt;: sensores S01..S&lt;s&gt;, 15–30 °C</li><li>rajada-quente &lt;n&gt; &lt;s&gt;: 80 % das leituras de S01</li></ul>
+      <div class="lbl">No final de cada rajada</div><ul><li>instantes da primeira e da última publicação</li><li>número de leituras por partição</li></ul></div></div>
+
+    <div class="cls"><div class="hd"><b>PartitionLeader</b><span>ponto de entrada · rep02-lider</span></div><div class="bd">
+      <p>Invocação: <code>PartitionLeader &lt;k&gt; &lt;N&gt; [endereço] [api]</code>. O endereço anunciado assume por omissão <code>127.0.0.1</code>; o porto de recuperação é <code>7000+k</code>.</p>
+      <div class="lbl">Estado</div>
+      <ul><li>k, N, endereço anunciado, porto, Partitioner</li><li>RecordFile lider-p&lt;k&gt;.txt</li><li>long ultimoSeq, inicializado com lastSeq() <span class="tag">partilhado</span></li></ul>
+      <div class="lbl">Operações propostas</div>
+      <ul><li>onIn(msg): valida o tipo e a partição; numa secção sincronizada incrementa seq e executa append; publica reg(host, porto, r)</li><li>atender(Socket): lê PEDIDO, limita o extremo superior, responde com range e FIM, ou ERRO</li></ul>
+      <div class="lbl">Mensagens de diagnóstico</div><ul><li>REJEITADO · PARTIÇÃO ERRADA · RECUPERAÇÃO: de..até para … (n registos)</li></ul></div></div>
+
+    <div class="cls"><div class="hd"><b>PartitionReplica</b><span>ponto de entrada · rep02-replica</span></div><div class="bd">
+      <p>Invocação: <code>PartitionReplica &lt;id&gt; &lt;k1,k2&gt; [portoApi]</code>, com as propriedades <code>-Dperda=p</code> e <code>-Ddescartar=seq</code>, aplicadas exclusivamente à receção por PubSub.</p>
+      <div class="lbl">Estado por partição (classe interna proposta)</div>
+      <ul><li>int k · RecordFile replica-&lt;id&gt;-p&lt;k&gt;.txt</li><li>long ultimo, inicializado com lastSeq()</li><li>TreeMap&lt;Long, SensorRecord&gt; retidos</li><li>String hostLider · int portoLider, atualizados a cada REG</li></ul>
+      <div class="lbl">Operações propostas</div>
+      <ul><li>onReg(msg): simulação de perda, atualização do líder, aplicação</li><li>aplicar(r): regra descrita na secção 7</li><li>escreverEmSequencia(): escrita dos retidos contíguos</li><li>recuperar(): ligação TCP, PEDIDO e leitura até FIM</li></ul>
+      <div class="lbl">Mensagens de diagnóstico</div><ul><li>DUPLICADO · EM ESPERA · REJEITADO · DESCARTADO (simulação) · RECUPERAÇÃO … pedida a · RECUPERADO · RECUPERAÇÃO FALHOU</li></ul></div></div>
+
+    <div class="cls"><div class="hd"><b>PartitionCheck</b><span>ponto de entrada · rep02-replica</span></div><div class="bd">
+      <p>Invocação: <code>PartitionCheck &lt;N&gt; &lt;pasta&gt;</code>. Produz, para cada partição k, um relatório que verifica:</p>
+      <ul><li>que todos os registos do líder satisfazem of(sensor) == k</li><li>que a sequência começa em 1, sem lacunas nem repetições</li><li>o número de réplicas (esperado: 2) e, para cada uma, igualdade ou prefixo e registos em falta</li><li>o número de registos e de sensores distintos</li><li>que o total do sistema coincide com a soma das partições</li></ul></div></div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">6</span>Concorrência e estado partilhado</h2>
+  <div class="threads">
+    <div class="lane"><h3>PartitionLeader</h3>
+      <div class="th"><b>Atividade de entrada</b> (thread dedicada)<br>Bloqueia em <code>subscribe(topicIn(k))</code>. Escreve <code>ultimoSeq</code> e o ficheiro do líder.</div>
+      <div class="th"><b>Servidor de recuperação</b> (thread principal)<br>Bloqueia em <code>accept()</code> e, posteriormente, em <code>readLine()</code>. Lê <code>ultimoSeq</code>, para limitar o intervalo, e o ficheiro, através de <code>range</code>. As ligações são atendidas sequencialmente.</div>
+      <div class="shared"><b>Estado partilhado:</b> <code>ultimoSeq</code> e <code>lider-p&lt;k&gt;.txt</code>. A atribuição do número de sequência e o <code>append</code> devem integrar a mesma secção sincronizada; caso contrário, o servidor poderia observar um número de sequência ainda não persistido.</div>
+    </div>
+    <div class="lane"><h3>PartitionReplica</h3>
+      <div class="th"><b>Uma thread por partição</b><br>Bloqueia em <code>subscribe(topicData(k))</code>. A recuperação é executada nesta mesma thread e bloqueia em <code>connect</code> e <code>readLine</code>, no máximo <code>T_TCP_MS</code>.</div>
+      <div class="th"><b>Thread principal</b><br>Inicia as threads de subscrição e aguarda a sua conclusão.</div>
+      <div class="shared"><b>Estado partilhado:</b> reduzido, dado que cada partição dispõe de estado e ficheiro próprios. Exigem atenção o estado global da simulação (o descarte já efetuado e o gerador aleatório) e a escrita na consola. A recuperação de uma partição não interrompe a receção das restantes; durante esse período, as mensagens da partição em recuperação permanecem por ler na resposta HTTP do pedido de subscrição.</div>
+    </div>
+    <div class="lane"><h3>Producer</h3>
+      <div class="th"><b>Thread principal</b><br>Interpreta a consola e publica; o comando <code>rajada</code> publica em ciclo, à máxima cadência possível.</div>
+      <div class="shared" style="background:var(--code-bg)"><b>Sem estado partilhado.</b> O produtor não conserva as leituras enviadas, pelo que não tem capacidade de as retransmitir.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">7</span>Regra de aplicação na réplica</h2>
+  <p>A regra aplica-se independentemente a cada partição, tanto aos registos <code>REG</code> recebidos por PubSub como aos registos obtidos por recuperação.</p>
+  <div class="rules">
+    <div class="rule r-ok"><span class="cond">seq = último + 1</span><span>O registo é escrito; seguidamente, escrevem-se os registos retidos que passaram a estar em sequência (enquanto <code>retidos.firstKey() = último + 1</code>).</span></div>
+    <div class="rule r-dup"><span class="cond">seq ≤ último, ou já retido</span><span>O registo é considerado duplicado e ignorado. Esta condição impede a repetição de registos recebidos simultaneamente por PubSub e por TCP.</span></div>
+    <div class="rule r-hold"><span class="cond">seq &gt; último + 1</span><span>O registo é retido em memória. Se o número de retidos exceder <code>LIMITE_RETIDOS</code>, solicita-se o intervalo de <code>último + 1</code> a <code>retidos.firstKey() − 1</code>; cada registo recebido é aplicado segundo a mesma regra e, por fim, escrevem-se os retidos contíguos.</span></div>
+    <div class="rule r-fail"><span class="cond">falha na recuperação</span><span>Em caso de ligação recusada, tempo esgotado ou interrupção antes de <code>FIM</code>, mantêm-se os registos já escritos e os retidos em memória. A recuperação é novamente tentada na receção do registo seguinte da partição, uma vez que a condição persiste.</span></div>
+  </div>
+  <p class="note">Uma réplica iniciada com o ficheiro vazio retém todos os registos recebidos e, à décima primeira mensagem retida, obtém numa única ligação todo o histórico anterior da partição. A perda do último registo de uma série não é recuperada, porquanto não chegam os dez registos posteriores necessários para desencadear o pedido.</p>
+</section>
+
+<section>
+  <h2><span class="n">8</span>Sequência de uma recuperação</h2>
+  <figure>
+  <pre class="mermaid">
+sequenceDiagram
+    participant P as Produtor
+    participant L as Líder da partição 2 (porto 7002)
+    participant T as Tópico rep02-p2
+    participant R as Réplica 3 (partição 2)
+    P->>L: IN;S07;21.4 (via rep02-in-p2)
+    L->>L: secção sincronizada: seq = 42, append em lider-p2.txt
+    L->>T: REG;127.0.0.1;7002;42;S07;21.4;…
+    T--xR: mensagem perdida (entrega best-effort)
+    Note over R: Receção dos registos 43 a 53: onze retidos, acima de LIMITE_RETIDOS
+    R->>L: ligação a 127.0.0.1:7002 e envio de PEDIDO 42 42
+    L->>L: range(42, min(42, ultimoSeq))
+    L-->>R: 42;S07;21.4;…
+    L-->>R: FIM e encerramento da ligação
+    R->>R: aplicação do registo 42 e escrita dos retidos 43 a 53
+  </pre>
+  <figcaption><b>Figura 2.</b> Diagrama de sequência da recuperação de um registo perdido na partição 2.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2><span class="n">9</span>Distribuição dos ficheiros</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Processo</th><th>Partições</th><th>Ficheiros</th></tr></thead>
+    <tbody>
+      <tr><td>Líderes das partições 0, 1 e 2</td><td>p0 / p1 / p2</td><td><code>lider-p0.txt</code> · <code>lider-p1.txt</code> · <code>lider-p2.txt</code></td></tr>
+      <tr><td>Réplica 1</td><td>p0, p1</td><td><code>replica-1-p0.txt</code> · <code>replica-1-p1.txt</code></td></tr>
+      <tr><td>Réplica 2</td><td>p1, p2</td><td><code>replica-2-p1.txt</code> · <code>replica-2-p2.txt</code></td></tr>
+      <tr><td>Réplica 3</td><td>p2, p0</td><td><code>replica-3-p2.txt</code> · <code>replica-3-p0.txt</code></td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">A ordem de arranque é: réplicas, líderes e, por último, produtor. Cada partição encontra-se em exatamente duas réplicas, pelo que a falha de uma única réplica não torna nenhuma partição indisponível.</p>
+</section>
+
+<section>
+  <h2><span class="n">10</span>Limitações da arquitetura</h2>
+  <ul class="limits">
+    <li>As perdas no troço produtor → líder não são detetadas, por ausência de numeração nesse troço.</li>
+    <li>A perda dos últimos registos de uma série só é detetada após a receção de mais de dez registos posteriores.</li>
+    <li>A falha de um líder impede a escrita na respetiva partição e a recuperação das suas réplicas; o sistema não contempla eleição de líder nem consenso.</li>
+    <li>Não existe ordem entre partições: cada partição possui uma sequência própria e os respetivos números não são comparáveis.</li>
+    <li>Uma chave muito frequente (80 % das leituras de S01) concentra a carga numa única partição.</li>
+    <li>A alteração de N reatribui a maioria dos sensores a outra partição, invalidando a correspondência dos ficheiros existentes.</li>
+    <li>Não há verificação de origem: um processo arbitrário pode publicar um <code>REG</code> com um endereço falso e desviar os pedidos de recuperação.</li>
+  </ul>
+</section>
+</div>
+
+<!--claude-mermaid-runtime-begin:3477-->
+<style>.mermaid-diagram{margin-block:4px}.mermaid-diagram svg{display:block;margin:0 auto;max-width:100%;height:auto}</style>
+<script src="/_runtime/mermaid-11.16.1.min.js"></script>
+<script>(function(){
+var CFG={"palettes":{"light":{"surface":"#f4efe4","text":"#42392e","line":"#8a7f6d","border":"#7a6c52","bg":"#fffdf8"},"dark":{"surface":"#262b34","text":"#f2f3f5","line":"#a8adb8","border":"#9aa4b8","bg":"#1f232b"}}};
+if(typeof mermaid==='undefined')return;
+var pres=Array.prototype.slice.call(document.querySelectorAll('pre.mermaid')).filter(function(p){if(p.hasAttribute('data-claude-mermaid-claimed'))return false;p.setAttribute('data-claude-mermaid-claimed','1');return true;});
+if(!pres.length)return;
+var mq=window.matchMedia?window.matchMedia('(prefers-color-scheme: dark)'):null;
+var root=document.documentElement;
+var items=pres.map(function(pre){
+var mount=document.createElement('div');mount.className='mermaid-diagram';
+return {pre:pre,mount:mount,src:pre.textContent||''};
+});
+var seq=0;
+var renderGen=0;
+var lastKey='';
+function pageBg(fallback){
+var els=[document.body,document.documentElement];
+for(var i=0;i<els.length;i++){
+var c=els[i]&&getComputedStyle(els[i]).backgroundColor;
+if(c&&c!=='transparent'&&c!=='rgba(0, 0, 0, 0)')return c;
+}
+return fallback;
+}
+function render(){
+var theme=root.getAttribute('data-theme');
+var dark=theme==='dark'||(!!(mq&&mq.matches)&&theme!=='light');
+var pal=dark?CFG.palettes.dark:CFG.palettes.light;
+var bg=pageBg(pal.bg);
+var key=(dark?'d':'l')+'|'+bg;
+if(key===lastKey)return;
+lastKey=key;
+var gen=++renderGen;
+var font=getComputedStyle(document.body).fontFamily||'sans-serif';
+var nat={useMaxWidth:false};
+mermaid.initialize({
+startOnLoad:false,securityLevel:'strict',theme:'base',
+flowchart:nat,sequence:nat,er:nat,state:nat,class:nat,pie:nat,
+gantt:nat,journey:nat,timeline:nat,gitGraph:nat,mindmap:nat,xyChart:nat,
+quadrantChart:nat,sankey:nat,c4:nat,requirement:nat,block:nat,
+packet:nat,kanban:nat,architecture:nat,radar:nat,
+themeVariables:{background:bg,mainBkg:pal.surface,primaryColor:pal.surface,
+primaryTextColor:pal.text,lineColor:pal.line,primaryBorderColor:pal.border,
+nodeBorder:pal.border,clusterBorder:pal.border,edgeLabelBackground:bg,
+clusterBkg:'rgba(127,127,127,0.07)',titleColor:pal.text,
+darkMode:dark,rowOdd:bg,rowEven:'rgba(127,127,127,0.07)',
+attributeBackgroundColorOdd:bg,attributeBackgroundColorEven:'rgba(127,127,127,0.07)',
+fontSize:'16px',fontFamily:font},
+themeCSS:'.node rect, .node circle, .node polygon, .node path, .cluster rect { stroke-width: 2px; }'
+});
+items.forEach(function(it){
+var id='claude-mermaid-'+seq++;
+mermaid.render(id,it.src).then(function(r){
+if(gen!==renderGen)return;
+var prev=it.pre.previousElementSibling;
+if(prev&&prev.className==='mermaid-diagram'&&prev!==it.mount)return;
+it.mount.innerHTML=r.svg;
+if(!it.mount.parentNode)it.pre.parentNode.insertBefore(it.mount,it.pre);
+it.pre.style.display='none';
+},function(){
+var scratch=document.getElementById(id);
+if(scratch)scratch.parentNode.removeChild(scratch);
+scratch=document.getElementById('d'+id);
+if(scratch)scratch.parentNode.removeChild(scratch);
+if(gen!==renderGen)return;
+if(it.mount.parentNode)it.mount.parentNode.removeChild(it.mount);
+it.pre.style.display='';
+});
+});
+}
+render();
+if(mq&&mq.addEventListener)mq.addEventListener('change',render);
+if(typeof MutationObserver!=='undefined')new MutationObserver(render).observe(root,{attributes:true,attributeFilter:['data-theme']});
+})();</script>
+<!--claude-mermaid-runtime-end-->
+
+</body></html>
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\ilustração.html ===
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>COMINDIR02 · Animação</title>
+<style>
+  :root {
+    --bg: #f7f6f2; --panel: #ffffff; --ink: #1f1e1b; --quiet: #6b6860; --line: #d6d3ca; --grid: #ebe8e0;
+    --p0: #2f6fdb; --p1: #1f9d6b; --p2: #d9822b; --in: #8a867c; --tcp: #b0367a; --bad: #c8322b; --ok: #1f9d6b;
+    --tint: #efede6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1a18; --panel: #252421; --ink: #ecebe6; --quiet: #a39f95; --line: #4a4740; --grid: #33312d;
+      --p0: #6d9cf0; --p1: #4cc596; --p2: #f0a35a; --in: #9c978c; --tcp: #e06aad; --bad: #ef6a5f; --ok: #4cc596;
+      --tint: #2e2c28;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--quiet); margin: 0 0 16px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 8px; padding: 5px 10px; cursor: pointer; }
+  button:hover { border-color: var(--quiet); }
+  button.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  button.off { border-color: var(--bad); color: var(--bad); }
+  label { display: inline-flex; align-items: center; gap: 6px; color: var(--quiet); }
+  input[type=range] { width: 110px; }
+  .sep { width: 1px; align-self: stretch; background: var(--line); }
+  .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  svg { display: block; width: 100%; height: auto; }
+  .caption { border-top: 1px solid var(--line); padding: 10px 14px; min-height: 44px; color: var(--ink); }
+  .caption b { color: var(--tcp); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  @media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 8px; }
+  #log { list-style: none; margin: 0; padding: 0; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-height: 300px; overflow: auto; }
+  #log li { padding: 1px 0; border-bottom: 1px dashed var(--grid); }
+  #log .t { color: var(--quiet); margin-right: 6px; }
+  #log .bad { color: var(--bad); } #log .tcp { color: var(--tcp); } #log .ok { color: var(--ok); } #log .q { color: var(--quiet); }
+  ol { margin: 0; padding-left: 20px; } ol li { margin-bottom: 6px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; color: var(--quiet); font-size: 12.5px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+  code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--tint); padding: 0 4px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>COMINDIR02 · Particionamento e recuperação com publish/subscribe</h1>
+  <p class="sub">Três partições (N = 3), cada uma com um líder, um tópico de dados e duas réplicas (R = 2). As réplicas recuperam por TCP quando acumulam mais de 10 registos retidos numa partição.</p>
+
+  <div class="controls">
+    <button id="bPlay" class="on">Pausa</button>
+    <button id="bAuto" class="on">Leituras automáticas</button>
+    <button id="bOne">1 leitura</button>
+    <button id="bBurst">Rajada de 40</button>
+    <span class="sep"></span>
+    <label>Perda no PubSub <input id="sLoss" type="range" min="0" max="50" value="15"><span id="vLoss">15 %</span></label>
+    <label>Velocidade <input id="sSpeed" type="range" min="25" max="300" value="100"><span id="vSpeed">1,0×</span></label>
+    <span class="sep"></span>
+    <button id="bR0">Parar réplica 1</button>
+    <button id="bR1">Parar réplica 2</button>
+    <button id="bR2">Parar réplica 3</button>
+    <span class="sep"></span>
+    <button id="bReset">Reiniciar</button>
+  </div>
+
+  <div class="stage">
+    <svg id="svg" viewBox="0 0 1000 590" role="img" aria-label="Animação do produtor, líderes de partição, tópicos e réplicas, com recuperação por TCP"></svg>
+    <div class="caption" id="caption">As leituras entram pelo produtor, que calcula a partição de cada sensor com <code>floorMod(hashCode, 3)</code>.</div>
+  </div>
+
+  <div class="cols">
+    <div class="card">
+      <h2>Registo de eventos</h2>
+      <ul id="log"></ul>
+    </div>
+    <div class="card">
+      <h2>O que a animação mostra</h2>
+      <ol>
+        <li>O <b>produtor</b> calcula a partição do sensor e publica <code>IN;sensor;temperatura</code> no tópico <code>rep02-in-p&lt;k&gt;</code>.</li>
+        <li>O <b>líder</b> da partição atribui o número de sequência seguinte, acrescenta o registo a <code>lider-p&lt;k&gt;.txt</code> e publica <code>REG;127.0.0.1;700k;seq;…</code> em <code>rep02-p&lt;k&gt;</code>. O endereço e o porto seguem em todas as mensagens.</li>
+        <li>Cada <b>réplica</b> aplica a regra da COMINDIR01: escreve o registo esperado, ignora duplicados e retém em memória os que chegam fora de ordem (quadrados preenchidos). A réplica aprende o endereço do líder com a primeira mensagem recebida.</li>
+        <li>Quando há <b>mais de 10 retidos</b> numa partição, a réplica abre uma ligação <b>TCP</b> ao endereço anunciado e envia <code>PEDIDO de até</code>. O líder responde com os registos lidos do seu ficheiro e <code>FIM</code>. Durante a recuperação, as mensagens do PubSub dessa partição ficam em fila.</li>
+        <li>Uma réplica parada perde as mensagens e a memória; ao arrancar, retém o que recebe e recupera o histórico em falta quando ultrapassa o limite. Perdas no fim de uma série só são recuperadas quando chegarem mais de 10 registos posteriores.</li>
+      </ol>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--in)"></span>IN (produtor → líder)</span>
+        <span><span class="dot" style="background:var(--p0)"></span>REG p0</span>
+        <span><span class="dot" style="background:var(--p1)"></span>REG p1</span>
+        <span><span class="dot" style="background:var(--p2)"></span>REG p2</span>
+        <span><span class="dot" style="background:var(--tcp)"></span>TCP de recuperação</span>
+        <span style="color:var(--bad)">× mensagem perdida</span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.getElementById('svg');
+  const N = 3, LIM = 10, PORT = 7000, HOST = '127.0.0.1';
+  const COL = ['var(--p0)', 'var(--p1)', 'var(--p2)'];
+  const Y = [140, 300, 460];
+  const ASSIGN = [[0, 1], [1, 2], [2, 0]];
+  const ROW_OFF = [-8, 34];
+
+  // geometria
+  const PROD = { x: 30, w: 100, y: 300 };
+  const INT = { cx: 250, w: 130 };
+  const LEAD = { x: 345, w: 155 };
+  const DATT = { cx: 600, w: 120 };
+  const REP = { x: 720, w: 260, h: 118 };
+
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function txt(x, y, s, attrs, parent) {
+    const t = el('text', Object.assign({ x, y, fill: 'var(--ink)', 'font-size': 13 }, attrs || {}), parent);
+    t.textContent = s;
+    return t;
+  }
+
+  // hashCode de String do Java e floorMod
+  function jhash(s) { let h = 0; for (const c of s) h = (Math.imul(h, 31) + c.charCodeAt(0)) | 0; return h; }
+  const partOf = s => ((jhash(s) % N) + N) % N;
+
+  // caminhos (polilinhas) e interpolação
+  function poly(pts) {
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+    return { pts, cum, total: cum[cum.length - 1] };
+  }
+  function pointAt(p, t) {
+    const d = Math.max(0, Math.min(1, t)) * p.total;
+    let i = 1;
+    while (i < p.cum.length - 1 && p.cum[i] < d) i++;
+    const seg = p.cum[i] - p.cum[i - 1] || 1, f = (d - p.cum[i - 1]) / seg;
+    const a = p.pts[i - 1], b = p.pts[i];
+    return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+  }
+  function arcPts(x1, y1, x2, y2, cx, cy) {
+    const out = [];
+    for (let i = 0; i <= 28; i++) {
+      const t = i / 28, u = 1 - t;
+      out.push([u * u * x1 + 2 * u * t * cx + t * t * x2, u * u * y1 + 2 * u * t * cy + t * t * y2]);
+    }
+    return out;
+  }
+  const inPath = k => poly([[PROD.x + PROD.w, PROD.y], [INT.cx - INT.w / 2, Y[k]], [INT.cx + INT.w / 2, Y[k]], [LEAD.x, Y[k]]]);
+  const repRowY = (r, k) => Y[r] + ROW_OFF[ASSIGN[r].indexOf(k)];
+  const regPath = (k, r) => poly([[LEAD.x + LEAD.w, Y[k]], [DATT.cx - DATT.w / 2, Y[k]], [DATT.cx + DATT.w / 2, Y[k]], [REP.x, repRowY(r, k)]]);
+  function tcpPts(r, k) {
+    const x1 = REP.x, y1 = repRowY(r, k), x2 = LEAD.x + LEAD.w / 2, y2 = Y[k] + 36;
+    const cy = Math.min(575, Math.max(y1, y2) + 70);
+    return arcPts(x1, y1, x2, y2, (x1 + x2) / 2, cy);
+  }
+
+  // camadas
+  let gGuides, gStatic, gTcp, gParts;
+  const ui = { leaders: [], reps: [] };
+
+  // estado
+  let S;
+  function freshState() {
+    return {
+      time: 0, timers: [], particles: [], autoAcc: 0,
+      leaders: Array.from({ length: N }, () => ({ seq: 0, file: [] })),
+      reps: ASSIGN.map(parts => ({
+        online: true,
+        parts: Object.fromEntries(parts.map(k => [k, { last: 0, retained: new Set(), recovering: false, queue: [], addr: null, recId: 0, arc: null }]))
+      }))
+    };
+  }
+
+  function build() {
+    svg.innerHTML = '';
+    const defs = el('defs', {}, svg);
+    const m = el('marker', { id: 'arr', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse' }, defs);
+    el('path', { d: 'M0 0L10 5L0 10z', fill: 'var(--line)' }, m);
+
+    // títulos das colunas
+    const hy = 40;
+    txt(PROD.x + PROD.w / 2, hy, 'produtor', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 12 }, svg);
+    txt(INT.cx, hy, 'tópicos de entrada', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 12 }, svg);
+    txt(LEAD.x + LEAD.w / 2, hy, 'líderes de partição', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 12 }, svg);
+    txt(DATT.cx, hy, 'tópicos de dados', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 12 }, svg);
+    txt(REP.x + REP.w / 2, hy, 'réplicas (R = 2)', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 12 }, svg);
+    txt(500, 70, 'gossipsub do IPFS: as mensagens podem perder-se ou chegar fora de ordem', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 11 }, svg);
+
+    gGuides = el('g', { fill: 'none', stroke: 'var(--line)', 'stroke-width': 1.2 }, svg);
+    for (let k = 0; k < N; k++) {
+      el('polyline', { points: inPath(k).pts.map(p => p.join(',')).join(' '), 'marker-end': 'url(#arr)' }, gGuides);
+      for (let r = 0; r < N; r++) if (ASSIGN[r].includes(k))
+        el('polyline', { points: regPath(k, r).pts.map(p => p.join(',')).join(' '), 'marker-end': 'url(#arr)' }, gGuides);
+    }
+    gTcp = el('g', {}, svg);
+    gStatic = el('g', {}, svg);
+
+    // produtor
+    el('rect', { x: PROD.x, y: PROD.y - 32, width: PROD.w, height: 64, rx: 8, fill: 'var(--panel)', stroke: 'var(--line)', 'stroke-width': 1.25 }, gStatic);
+    txt(PROD.x + PROD.w / 2, PROD.y - 6, 'Produtor', { 'text-anchor': 'middle', 'font-weight': 600 }, gStatic);
+    txt(PROD.x + PROD.w / 2, PROD.y + 12, 'calcula k', { 'text-anchor': 'middle', fill: 'var(--quiet)', 'font-size': 11 }, gStatic);
+
+    ui.leaders = []; ui.reps = [];
+    for (let k = 0; k < N; k++) {
+      // tópicos
+      el('rect', { x: INT.cx - INT.w / 2, y: Y[k] - 16, width: INT.w, height: 32, rx: 16, fill: 'var(--tint)', stroke: 'var(--line)' }, gStatic);
+      txt(INT.cx, Y[k] + 4, 'rep02-in-p' + k, { 'text-anchor': 'middle', 'font-size': 12 }, gStatic);
+      el('rect', { x: DATT.cx - DATT.w / 2, y: Y[k] - 16, width: DATT.w, height: 32, rx: 16, fill: 'var(--tint)', stroke: COL[k] }, gStatic);
+      txt(DATT.cx, Y[k] + 4, 'rep02-p' + k, { 'text-anchor': 'middle', 'font-size': 12 }, gStatic);
+      // líder
+      const box = el('rect', { x: LEAD.x, y: Y[k] - 36, width: LEAD.w, height: 72, rx: 8, fill: 'var(--panel)', stroke: COL[k], 'stroke-width': 1.5 }, gStatic);
+      txt(LEAD.x + LEAD.w / 2, Y[k] - 14, 'Líder p' + k, { 'text-anchor': 'middle', 'font-weight': 600 }, gStatic);
+      const seqT = txt(LEAD.x + LEAD.w / 2, Y[k] + 4, '', { 'text-anchor': 'middle', 'font-size': 11.5 }, gStatic);
+      txt(LEAD.x + LEAD.w / 2, Y[k] + 22, 'TCP ' + HOST + ':' + (PORT + k), { 'text-anchor': 'middle', 'font-size': 11, fill: 'var(--quiet)' }, gStatic);
+      ui.leaders.push({ box, seqT, flash: 0 });
+    }
+    for (let r = 0; r < N; r++) {
+      const g = el('g', {}, gStatic);
+      const box = el('rect', { x: REP.x, y: Y[r] - 62, width: REP.w, height: REP.h + 6, rx: 8, fill: 'var(--panel)', stroke: 'var(--line)', 'stroke-width': 1.25 }, g);
+      const title = txt(REP.x + 12, Y[r] - 42, 'Réplica ' + (r + 1), { 'font-weight': 600 }, g);
+      const state = txt(REP.x + REP.w - 12, Y[r] - 42, '', { 'text-anchor': 'end', 'font-size': 11, fill: 'var(--quiet)' }, g);
+      const rows = {};
+      for (const k of ASSIGN[r]) {
+        const ry = repRowY(r, k);
+        const l1 = txt(REP.x + 12, ry - 2, '', { 'font-size': 11.5 }, g);
+        const l2 = txt(REP.x + 12, ry + 14, '', { 'font-size': 11, fill: 'var(--quiet)' }, g);
+        const sq = [];
+        for (let i = 0; i < 11; i++)
+          sq.push(el('rect', { x: REP.x + 112 + i * 11, y: ry + 6, width: 9, height: 9, rx: 2, fill: 'none', stroke: 'var(--line)' }, g));
+        el('line', { x1: REP.x + 112 + 10 * 11 - 1, x2: REP.x + 112 + 10 * 11 - 1, y1: ry + 3, y2: ry + 18, stroke: 'var(--bad)', 'stroke-width': 1.5 }, g);
+        rows[k] = { l1, l2, sq };
+      }
+      ui.reps.push({ box, title, state, rows });
+    }
+    gParts = el('g', {}, svg);
+    render();
+  }
+
+  // eventos agendados e partículas
+  function schedule(delay, fn) { S.timers.push({ at: S.time + delay, fn }); }
+  function spawn(path, dur, color, label, onArrive, opts) {
+    opts = opts || {};
+    const g = el('g', {}, gParts);
+    const c = opts.square
+      ? el('rect', { x: -5, y: -5, width: 10, height: 10, rx: 2, fill: color }, g)
+      : el('circle', { r: opts.r || 6, fill: color }, g);
+    let t = null;
+    if (label) t = txt(0, -9, label, { 'text-anchor': 'middle', 'font-size': 10.5, fill: color, 'font-weight': 600 }, g);
+    S.particles.push({ path, dur, t: 0, g, onArrive, lossAt: opts.lossAt, onLost: opts.onLost, dead: false, fade: -1 });
+  }
+  function stepParticles(dt) {
+    for (const p of S.particles) {
+      if (p.fade >= 0) {
+        p.fade += dt;
+        p.g.setAttribute('opacity', Math.max(0, 1 - p.fade / 0.8));
+        if (p.fade > 0.8) { p.dead = true; p.g.remove(); }
+        continue;
+      }
+      p.t += dt / p.dur;
+      if (p.lossAt != null && p.t >= p.lossAt) {
+        const [x, y] = pointAt(p.path, p.lossAt);
+        p.g.innerHTML = '';
+        p.g.setAttribute('transform', `translate(${x},${y})`);
+        txt(0, 5, '×', { 'text-anchor': 'middle', 'font-size': 18, fill: 'var(--bad)', 'font-weight': 700 }, p.g);
+        p.fade = 0;
+        if (p.onLost) p.onLost();
+        continue;
+      }
+      if (p.t >= 1) { p.dead = true; p.g.remove(); if (p.onArrive) p.onArrive(); continue; }
+      const [x, y] = pointAt(p.path, p.t);
+      p.g.setAttribute('transform', `translate(${x},${y})`);
+    }
+    S.particles = S.particles.filter(p => !p.dead);
+  }
+
+  // registo de eventos
+  const logEl = document.getElementById('log');
+  const caption = document.getElementById('caption');
+  let logs = [];
+  function log(s, cls) {
+    logs.unshift({ t: S.time.toFixed(1), s, cls: cls || '' });
+    if (logs.length > 120) logs.length = 120;
+    logEl.innerHTML = logs.slice(0, 60).map(l => `<li class="${l.cls}"><span class="t">${l.t}s</span>${l.s}</li>`).join('');
+  }
+  function say(html) { caption.innerHTML = html; }
+
+  // produtor
+  function produce() {
+    const n = 1 + Math.floor(Math.random() * 20);
+    const sensor = 'S' + String(n).padStart(2, '0');
+    const temp = (15 + Math.random() * 15).toFixed(1);
+    const k = partOf(sensor);
+    log(`Produtor: IN ${sensor} ${temp} → p${k}`, 'q');
+    spawn(inPath(k), 0.9, 'var(--in)', null, () => leaderReceive(k, sensor, temp), { r: 5 });
+  }
+
+  // líder
+  function leaderReceive(k, sensor, temp) {
+    const L = S.leaders[k];
+    L.seq++;
+    L.file.push({ seq: L.seq, sensor, temp });
+    ui.leaders[k].flash = 0.35;
+    const seq = L.seq;
+    for (let r = 0; r < N; r++) if (ASSIGN[r].includes(k)) sendReg(k, r, seq);
+  }
+  function sendReg(k, r, seq) {
+    const loss = Number(document.getElementById('sLoss').value) / 100;
+    const lost = Math.random() < loss;
+    spawn(regPath(k, r), 1.0 + Math.random() * 0.8, COL[k], String(seq), () => replicaReceive(r, k, seq), {
+      lossAt: lost ? 0.82 : null,
+      onLost: () => log(`R${r + 1}/p${k}: REG ${seq} perdido na rede`, 'bad')
+    });
+  }
+
+  // réplica
+  function replicaReceive(r, k, seq) {
+    const R = S.reps[r], P = R.parts[k];
+    if (!R.online) { log(`R${r + 1}/p${k}: parada, REG ${seq} não recebido`, 'bad'); return; }
+    P.addr = HOST + ':' + (PORT + k);
+    if (P.recovering) { P.queue.push(seq); return; }
+    apply(r, k, seq, 'pubsub');
+  }
+  function apply(r, k, seq, src) {
+    const P = S.reps[r].parts[k];
+    if (seq <= P.last || P.retained.has(seq)) { if (src === 'pubsub') log(`R${r + 1}/p${k}: DUPLICADO ${seq}`, 'q'); return; }
+    if (seq === P.last + 1) {
+      P.last = seq;
+      if (src === 'tcp') log(`R${r + 1}/p${k}: RECUPERADO ${seq}`, 'tcp');
+      drain(P);
+      return;
+    }
+    P.retained.add(seq);
+    log(`R${r + 1}/p${k}: EM ESPERA ${seq} (falta ${P.last + 1}) · retidos ${P.retained.size}`);
+    if (P.retained.size > LIM && !P.recovering && src === 'pubsub') recover(r, k);
+  }
+  function drain(P) { while (P.retained.has(P.last + 1)) { P.retained.delete(P.last + 1); P.last++; } }
+
+  function recover(r, k) {
+    const P = S.reps[r].parts[k];
+    const a = P.last + 1, b = Math.min(...P.retained) - 1;
+    P.recovering = true;
+    const id = ++P.recId;
+    const pts = tcpPts(r, k);
+    P.arc = el('polyline', { points: pts.map(p => p.join(',')).join(' '), fill: 'none', stroke: 'var(--tcp)', 'stroke-width': 1.6, 'stroke-dasharray': '6 4' }, gTcp);
+    const there = poly(pts), back = poly(pts.slice().reverse());
+    log(`R${r + 1}/p${k}: RECUPERAÇÃO ${a}..${b} pedida a ${P.addr} (${P.retained.size} retidos)`, 'tcp');
+    say(`<b>Recuperação:</b> a réplica ${r + 1} tem ${P.retained.size} registos retidos na partição ${k} (limite ${LIM}). Abre uma ligação TCP a <code>${P.addr}</code>, endereço anunciado nas mensagens, e envia <code>PEDIDO ${a} ${b}</code>.`);
+    const alive = () => S.reps[r].online && P.recId === id;
+    spawn(there, 0.8, 'var(--tcp)', `PEDIDO ${a} ${b}`, () => {
+      if (!alive()) return;
+      const recs = S.leaders[k].file.filter(x => x.seq >= a && x.seq <= b);
+      log(`Líder p${k}: RECUPERAÇÃO ${a}..${b} para R${r + 1} (${recs.length} registos)`, 'tcp');
+      ui.leaders[k].flash = 0.5;
+      say(`<b>Resposta do líder ${k}:</b> lê os registos ${a} a ${b} de <code>lider-p${k}.txt</code> e envia-os, por ordem, na mesma ligação, seguidos de <code>FIM</code>. As mensagens do PubSub que chegam entretanto à réplica ficam em fila.`);
+      const step = Math.min(0.14, 2.4 / Math.max(1, recs.length));
+      recs.forEach((x, i) => schedule(i * step, () => {
+        if (!alive()) return;
+        spawn(back, 0.7, 'var(--tcp)', String(x.seq), () => { if (alive()) apply(r, k, x.seq, 'tcp'); }, { square: true });
+      }));
+      schedule(recs.length * step + 0.05, () => {
+        if (!alive()) return;
+        spawn(back, 0.7, 'var(--tcp)', 'FIM', () => { if (alive()) finish(r, k); }, { r: 4 });
+      });
+    });
+  }
+  function finish(r, k) {
+    const P = S.reps[r].parts[k];
+    P.recovering = false;
+    if (P.arc) { P.arc.remove(); P.arc = null; }
+    drain(P);
+    const q = P.queue; P.queue = [];
+    log(`R${r + 1}/p${k}: FIM recebido; último ${P.last}; ${q.length} mensagens em fila aplicadas`, 'ok');
+    say(`A réplica ${r + 1} fechou a ligação, escreveu os retidos que ficaram em sequência e aplicou as ${q.length} mensagens que aguardavam em fila. A partição ${k} está no registo ${P.last}.`);
+    for (const s of q) {
+      if (P.recovering) P.queue.push(s); else apply(r, k, s, 'pubsub');
+    }
+  }
+
+  function toggleReplica(r) {
+    const R = S.reps[r];
+    R.online = !R.online;
+    if (!R.online) {
+      for (const k in R.parts) {
+        const P = R.parts[k];
+        P.retained.clear(); P.queue = []; P.recovering = false; P.recId++;
+        if (P.arc) { P.arc.remove(); P.arc = null; }
+      }
+      log(`Réplica ${r + 1} parada: a memória (retidos e fila) perde-se; os ficheiros mantêm-se`, 'bad');
+      say(`A réplica ${r + 1} está parada. Não recebe as mensagens publicadas: o PubSub não as guarda.`);
+    } else {
+      const parts = Object.entries(R.parts).map(([k, P]) => `p${k}=${P.last}`).join(', ');
+      log(`Réplica ${r + 1} arrancada: lastSeq() ${parts}`, 'ok');
+      say(`A réplica ${r + 1} voltou a arrancar com os ficheiros em ${parts}. Vai reter o que receber e recuperar por TCP quando ultrapassar ${LIM} retidos.`);
+    }
+    syncButtons();
+  }
+
+  // desenho do estado
+  function render() {
+    for (let k = 0; k < N; k++) {
+      const L = S.leaders[k], u = ui.leaders[k];
+      u.seqT.textContent = `lider-p${k}.txt: ${L.seq} registos`;
+      u.box.setAttribute('stroke-width', u.flash > 0 ? 3 : 1.5);
+    }
+    for (let r = 0; r < N; r++) {
+      const R = S.reps[r], u = ui.reps[r];
+      u.box.setAttribute('stroke', R.online ? 'var(--line)' : 'var(--bad)');
+      u.box.setAttribute('stroke-dasharray', R.online ? '' : '5 4');
+      u.state.textContent = R.online ? 'em execução' : 'parada';
+      u.state.setAttribute('fill', R.online ? 'var(--quiet)' : 'var(--bad)');
+      for (const k of ASSIGN[r]) {
+        const P = R.parts[k], row = u.rows[k], L = S.leaders[k];
+        const eq = P.last === L.seq && P.retained.size === 0;
+        row.l1.textContent = `p${k}  ${P.last}/${L.seq} ${eq ? '✓' : '≠'}   líder: ${P.addr || '?'}`;
+        row.l1.setAttribute('fill', P.recovering ? 'var(--tcp)' : 'var(--ink)');
+        row.l2.textContent = P.recovering ? `TCP · fila ${P.queue.length}` : `retidos ${P.retained.size}`;
+        row.l2.setAttribute('fill', P.recovering ? 'var(--tcp)' : 'var(--quiet)');
+        const n = P.retained.size;
+        row.sq.forEach((s, i) => {
+          s.setAttribute('fill', i < n ? COL[k] : 'none');
+          s.setAttribute('stroke', i < n ? COL[k] : 'var(--line)');
+        });
+      }
+    }
+  }
+
+  // ciclo de animação
+  let playing = true, auto = true, lastTs = null;
+  function frame(ts) {
+    if (lastTs == null) lastTs = ts;
+    const speed = Number(document.getElementById('sSpeed').value) / 100;
+    const dt = playing ? Math.min(0.05, (ts - lastTs) / 1000) * speed : 0;
+    lastTs = ts;
+    if (dt > 0) {
+      S.time += dt;
+      if (auto) { S.autoAcc += dt; while (S.autoAcc > 0.45) { S.autoAcc -= 0.45; produce(); } }
+      const due = S.timers.filter(t => t.at <= S.time);
+      S.timers = S.timers.filter(t => t.at > S.time);
+      due.sort((a, b) => a.at - b.at).forEach(t => t.fn());
+      stepParticles(dt);
+      ui.leaders.forEach(u => { if (u.flash > 0) u.flash -= dt; });
+      render();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // controlos
+  const $ = id => document.getElementById(id);
+  function syncButtons() {
+    $('bPlay').textContent = playing ? 'Pausa' : 'Continuar';
+    $('bPlay').classList.toggle('on', playing);
+    $('bAuto').classList.toggle('on', auto);
+    for (let r = 0; r < N; r++) {
+      const b = $('bR' + r), on = S.reps[r].online;
+      b.textContent = (on ? 'Parar' : 'Arrancar') + ' réplica ' + (r + 1);
+      b.classList.toggle('off', !on);
+    }
+  }
+  $('bPlay').onclick = () => { playing = !playing; syncButtons(); };
+  $('bAuto').onclick = () => { auto = !auto; syncButtons(); };
+  $('bOne').onclick = () => produce();
+  $('bBurst').onclick = () => { for (let i = 0; i < 40; i++) schedule(i * 0.06, produce); log('Produtor: rajada de 40 leituras', 'q'); };
+  for (let r = 0; r < N; r++) $('bR' + r).onclick = () => toggleReplica(r);
+  $('sLoss').oninput = e => $('vLoss').textContent = e.target.value + ' %';
+  $('sSpeed').oninput = e => $('vSpeed').textContent = (e.target.value / 100).toFixed(1).replace('.', ',') + '×';
+  $('bReset').onclick = () => { reset(); };
+
+  function reset() {
+    S = freshState();
+    logs = []; logEl.innerHTML = '';
+    build();
+    say('As leituras entram pelo produtor, que calcula a partição de cada sensor com <code>floorMod(hashCode, 3)</code>.');
+    syncButtons();
+  }
+  reset();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\ilustração parte A.html ===
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recuperação por TCP</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout igual ao da COMINDIR01: narração, palco SVG (produtor → nó → líder → nó → réplicas, e TCP réplica → líder), inspetor, consolas */
+:root{
+  --bg:#ecf0f3; --panel:#ffffff; --ink:#17202b; --muted:#5b6876; --line:#c5ced8;
+  --prod:#4f6b16; --leader:#2a54b5; --net:#b06a0a; --rep:#17786b; --node:#6a45a8; --node-soft:#efe8f8;
+  --tcp:#b0306f; --tcp-soft:#f9e3ee; --bad:#b5372c; --chip:#f7e6c8; --chip-ink:#6b4100;
+  --cli:#1d2733; --cli-ink:#d9e4ee; --soft:#f5f7f9;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#10151b; --panel:#19212a; --ink:#e2e8ee; --muted:#92a0ae; --line:#33404d;
+  --prod:#a9c46a; --leader:#86a6f2; --net:#e3a44c; --rep:#52c2b0; --node:#b393ea; --node-soft:#2a2238;
+  --tcp:#f07fb5; --tcp-soft:#3a1f2d; --bad:#f07f73; --chip:#4a3a1e; --chip-ink:#f6d9a6;
+  --cli:#0b0f14; --cli-ink:#d9e4ee; --soft:#141b22; color-scheme:dark }}
+:root[data-theme="dark"]{
+  --bg:#10151b; --panel:#19212a; --ink:#e2e8ee; --muted:#92a0ae; --line:#33404d;
+  --prod:#a9c46a; --leader:#86a6f2; --net:#e3a44c; --rep:#52c2b0; --node:#b393ea; --node-soft:#2a2238;
+  --tcp:#f07fb5; --tcp-soft:#3a1f2d; --bad:#f07f73; --chip:#4a3a1e; --chip-ink:#f6d9a6;
+  --cli:#0b0f14; --cli-ink:#d9e4ee; --soft:#141b22; color-scheme:dark }
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1120px;margin:0 auto;padding-inline:16px;padding-block:28px 48px;display:grid;gap:18px}
+header{display:grid;gap:6px}
+.eyebrow{font-family:var(--f-mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--f-display);font-weight:700;font-size:clamp(28px,4.5vw,42px);line-height:1.05;margin:0;text-wrap:balance}
+h1 span{color:var(--tcp)}
+.lede{margin:0;max-width:72ch;color:var(--muted)}
+.tabs{display:flex;flex-wrap:wrap;gap:8px}
+.tab{font:500 14px/1.2 var(--f-body);color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 14px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
+.tab small{font-family:var(--f-mono);font-size:11px;color:var(--muted)}
+.tab[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.tab[aria-pressed="true"] small{color:var(--bg);opacity:.75}
+.tab:focus-visible,.btn:focus-visible,select:focus-visible{outline:2px solid var(--node);outline-offset:2px}
+.bench{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.caption{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;padding:16px 18px;border-bottom:1px solid var(--line);min-height:128px}
+.stepno{font-family:var(--f-display);font-weight:700;font-size:34px;line-height:1;color:var(--tcp);grid-row:span 3;font-variant-numeric:tabular-nums;min-width:2ch}
+.ctitle{font-family:var(--f-display);font-weight:600;font-size:20px;margin:0;text-wrap:balance}
+.ctext{margin:0;max-width:78ch;min-width:0}
+.ccode{font-family:var(--f-mono);font-size:12.5px;background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:4px 8px;justify-self:start;max-width:100%;overflow-x:auto;white-space:pre;margin-top:4px}
+.ccode:empty{display:none}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--soft)}
+.btn{font:500 14px/1 var(--f-body);background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px 14px;cursor:pointer}
+.btn.primary{background:var(--leader);color:var(--panel);border-color:var(--leader)}
+.controls label{font-size:13px;color:var(--muted);display:flex;gap:6px;align-items:center;margin-left:auto}
+select{font:14px var(--f-body);background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+.stagewrap{overflow-x:auto}
+#stage{display:block;width:100%;min-width:680px;height:auto}
+.inspector{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line)}
+.inspector div{padding:12px 16px;min-width:0;border-right:1px solid var(--line)}
+.inspector div:last-child{border-right:0}
+.inspector h3{margin:0 0 4px;font:600 12px var(--f-body);letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.inspector pre{margin:0;font:11.5px/1.5 var(--f-mono);white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
+@media (max-width:760px){.inspector{grid-template-columns:1fr}.inspector div{border-right:0;border-bottom:1px solid var(--line)}}
+/* SVG */
+.box{fill:var(--panel);stroke:var(--line);stroke-width:1.2}
+.hdr-l{fill:var(--leader)} .hdr-r{fill:var(--rep)} .hdr-n{fill:var(--node)} .hdr-p{fill:var(--prod)} .hdr-off{fill:var(--muted)}
+.hdrtxt{fill:var(--panel);font:600 13px var(--f-display);letter-spacing:.02em}
+.sub{fill:var(--muted);font:11px var(--f-mono)}
+.sub.tcpc{fill:var(--tcp);font-weight:600}
+.lbl{fill:var(--ink);font:500 12px var(--f-body)}
+.mono{fill:var(--ink);font:10.5px var(--f-mono)}
+.mono.fresh{fill:var(--rep);font-weight:600}
+.mono.fresh-l{fill:var(--leader);font-weight:600}
+.mono.fresh-t{fill:var(--tcp);font-weight:600}
+.nline{fill:var(--ink);font:10.5px var(--f-mono)}
+.nline.off{fill:var(--muted)}
+.clibg{fill:var(--cli)}
+.clitxt{fill:var(--cli-ink);font:12px var(--f-mono)}
+.badge-ok{fill:var(--panel);font:600 11px var(--f-mono)}
+.badge-bad{fill:#fff;font:600 11px var(--f-mono)}
+.badge-bad-bg{fill:var(--bad)}
+.link{fill:none;stroke:var(--line);stroke-width:2;stroke-dasharray:4 5}
+.stream{fill:none;stroke:var(--rep);stroke-width:2.2}
+.stream-l{fill:none;stroke:var(--leader);stroke-width:2.2}
+.http{fill:none;stroke:var(--prod);stroke-width:2;stroke-dasharray:2 4}
+.http-l{fill:none;stroke:var(--leader);stroke-width:2;stroke-dasharray:2 4}
+.tcp{fill:none;stroke:var(--tcp);stroke-width:1.6;stroke-dasharray:6 5;opacity:.35}
+.tcp.on{stroke-width:2.8;stroke-dasharray:none;opacity:1}
+.tcptxt{fill:var(--tcp);font:600 11px var(--f-display);letter-spacing:.05em}
+.port{fill:var(--tcp-soft);stroke:var(--tcp);stroke-width:1.5}
+.chip{fill:var(--chip);stroke:var(--net);stroke-width:1}
+.chiptxt{fill:var(--chip-ink);font:600 10px var(--f-mono)}
+.down rect.box{stroke-dasharray:5 4;opacity:.7}
+.status{font:500 11.5px var(--f-body);fill:var(--muted)}
+.status.bad{fill:var(--bad)}
+.status.busy{fill:var(--tcp);font-weight:600}
+.pk circle{fill:var(--net);stroke:var(--panel);stroke-width:2}
+.pk text{fill:#fff;font:600 10.5px var(--f-mono);text-anchor:middle}
+.pill rect{fill:var(--prod);stroke:var(--panel);stroke-width:2}
+.pill text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.reg rect{fill:var(--leader);stroke:var(--panel);stroke-width:2}
+.reg text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.sreq rect{fill:var(--rep);stroke:var(--panel);stroke-width:2}
+.sreq text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.tcpq rect{fill:var(--tcp);stroke:var(--panel);stroke-width:2}
+.tcpq text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.tcpr rect{fill:var(--panel);stroke:var(--tcp);stroke-width:1.8}
+.tcpr text{fill:var(--tcp);font:600 10.5px var(--f-mono);text-anchor:middle}
+.fade{transition:opacity .4s}
+/* consolas */
+.logs{display:grid;gap:8px}
+.logs h2{font-family:var(--f-display);font-weight:600;font-size:16px;margin:0;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.logs h2 span{font:12px var(--f-body);color:var(--muted)}
+#log{list-style:none;margin:0;padding:10px 0;background:var(--cli);color:var(--cli-ink);border-radius:10px;font:12.5px/1.55 var(--f-mono);height:240px;overflow:auto}
+#log li{display:grid;grid-template-columns:62px 1fr;gap:8px;padding:0 14px}
+#log li span{min-width:0;overflow-wrap:anywhere}
+#log b{font-weight:600}
+.t-P{color:#c3dc8c}.t-L{color:#8fb0ff}.t-R{color:#6fd6c4}.t-N{color:#c8a8ff}
+#log li.warn span{color:#ffb1a8}
+#log li.cmd span{color:#f2d58a}
+#log li.tcp span{color:#ff9fcb}
+.legend{display:flex;flex-wrap:wrap;gap:14px 22px;font-size:13px;color:var(--muted);margin:0;padding:0;list-style:none}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.foot{font-size:13px;color:var(--muted);max-width:80ch;margin:0}
+@media (max-width:560px){ .caption{grid-template-columns:1fr} .stepno{grid-row:auto;font-size:26px} .controls label{margin-left:0} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Sistemas Distribuídos · COMINDIR02 · 4.1 Parte A</div>
+    <h1>Recuperação de registos perdidos <span>por TCP</span></h1>
+    <p class="lede">Uma só partição. O produtor publica leituras no tópico de entrada, o líder numera-as, escreve-as no seu ficheiro e propaga-as com o seu endereço. Quando uma réplica tem mais de dez registos retidos, liga-se ao líder por TCP e pede os que lhe faltam.</p>
+  </header>
+
+  <nav class="tabs" aria-label="Cenários">
+    <button class="tab" data-sc="A" aria-pressed="true">Cinco leituras <small>ponto 6 · a</small></button>
+    <button class="tab" data-sc="B" aria-pressed="false">Réplica parada <small>ponto 6 · b</small></button>
+    <button class="tab" data-sc="C" aria-pressed="false">Registo descartado <small>ponto 6 · c</small></button>
+    <button class="tab" data-sc="D" aria-pressed="false">Rajada com perdas <small>ponto 6 · d</small></button>
+    <button class="tab" data-sc="E" aria-pressed="false">Réplica sem histórico <small>ponto 6 · e</small></button>
+  </nav>
+
+  <section class="bench" aria-label="Animação">
+    <div class="caption" aria-live="polite">
+      <div class="stepno" id="stepno">1</div>
+      <h2 class="ctitle" id="ctitle">A preparar</h2>
+      <p class="ctext" id="ctext">A animação está a carregar.</p>
+      <div class="ccode" id="ccode"></div>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="play">❚❚ Pausa</button>
+      <button class="btn" id="step">Próximo passo ›</button>
+      <button class="btn" id="restart">↺ Recomeçar</button>
+      <label for="speed">Velocidade
+        <select id="speed"><option value="0.5">0,5×</option><option value="1" selected>1×</option><option value="1.6">1,6×</option><option value="2.5">2,5×</option></select>
+      </label>
+    </div>
+    <div class="stagewrap">
+      <svg id="stage" viewBox="0 0 900 458" role="img" aria-label="Produtor, líder da partição 0, daemon Kubo e três réplicas; as réplicas ligam-se ao porto 7000 do líder por TCP para recuperar registos"></svg>
+    </div>
+    <div class="inspector" aria-label="Última mensagem">
+      <div><h3>Última mensagem no PubSub</h3><pre id="insMsg">—</pre></div>
+      <div><h3>Ligação TCP de recuperação</h3><pre id="insTcp">—</pre></div>
+      <div><h3>Regra aplicada na réplica</h3><pre id="insRule">—</pre></div>
+    </div>
+  </section>
+
+  <section class="logs">
+    <h2>Consolas <span>o que cada programa ou comando escreve no terminal</span></h2>
+    <ul id="log"></ul>
+  </section>
+
+  <ul class="legend">
+    <li><i style="background:var(--prod)"></i>Produtor e mensagem IN</li>
+    <li><i style="background:var(--leader)"></i>Líder da partição 0 e mensagem REG</li>
+    <li><i style="background:var(--node)"></i>Daemon Kubo</li>
+    <li><i style="background:var(--net)"></i>REG entregue a uma réplica</li>
+    <li><i style="background:var(--rep)"></i>Réplica e o seu pedido /pubsub/sub</li>
+    <li><i style="background:var(--tcp)"></i>Ligação TCP de recuperação (porto 7000)</li>
+    <li><i style="background:var(--chip);border:1px solid var(--net)"></i>Registo retido em memória</li>
+    <li><i style="background:var(--bad)"></i>Divergência</li>
+  </ul>
+  <p class="foot">A animação ilustra o comportamento descrito na ficha. Nos ficheiros desenhados, o instante aparece abreviado (só a hora). Os tempos, as perdas e as contagens são encenados com um gerador pseudoaleatório fixo, não são medições: os valores reais são os que cada aluno regista nos pontos 6 e 16.</p>
+</div>
+
+<script>
+(function(){
+const NS='http://www.w3.org/2000/svg';
+const svg=document.getElementById('stage');
+function el(tag,attrs,parent){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);(parent||svg).appendChild(e);return e;}
+function tx(x,y,cls,s,parent,anchor){const t=el('text',{x,y,class:cls},parent);if(anchor)t.setAttribute('text-anchor',anchor);t.textContent=s||'';return t;}
+
+const LIMITE=10, ADDR='127.0.0.1', PORT=7000;
+
+/* ---------- palco ---------- */
+const RY=[16,161,306];
+const links=el('g',{});
+const pPN=el('path',{d:'M210 90 C 255 90, 255 160, 300 160',class:'http'},links);
+const pNL=el('path',{d:'M300 222 C 255 222, 255 240, 210 240',class:'link'},links);
+const pLN=el('path',{d:'M210 262 C 255 262, 255 250, 300 250',class:'http-l'},links);
+const pNR=RY.map(y=>el('path',{d:`M500 215 C 585 215, 575 ${y+67} 660 ${y+67}`,class:'link'},links));
+const pTCP=RY.map(y=>el('path',{d:`M660 ${y+118} C 610 ${y+118}, 615 438, 555 438 L 262 438 C 232 438, 232 410, 212 410`,class:'tcp'},links));
+tx(255,118,'sub','HTTP',links,'middle');
+tx(400,453,'tcptxt','TCP · PEDIDO <de> <até> → registos → FIM',links,'middle');
+
+// produtor
+const Pg=el('g',{});
+el('rect',{x:20,y:20,width:190,height:140,rx:10,class:'box'},Pg);
+el('path',{d:'M20 30 a10 10 0 0 1 10 -10 h170 a10 10 0 0 1 10 10 v16 h-190 z',class:'hdr-p'},Pg);
+tx(32,38,'hdrtxt','Producer',Pg);
+el('rect',{x:30,y:56,width:170,height:32,rx:5,class:'clibg'},Pg);
+const Pcli=tx(38,77,'clitxt','',Pg);
+const Pstat=tx(30,110,'status','',Pg);
+const Pcount=tx(30,128,'lbl','',Pg);
+tx(30,148,'sub','publica em rep02-in-p0',Pg);
+
+// líder
+const Lg=el('g',{class:'fade'});
+el('rect',{x:20,y:186,width:190,height:258,rx:10,class:'box'},Lg);
+const Lhdr=el('path',{d:'M20 196 a10 10 0 0 1 10 -10 h170 a10 10 0 0 1 10 10 v16 h-190 z',class:'hdr-l'},Lg);
+tx(32,204,'hdrtxt','PartitionLeader 0 1',Lg);
+const Lseq=tx(30,230,'lbl','',Lg);
+tx(200,230,'sub tcpc',ADDR+':'+PORT,Lg,'end');
+const Lin=tx(30,247,'status','',Lg);
+el('line',{x1:30,y1:272,x2:200,y2:272,stroke:'var(--line)'},Lg);
+const Lfh=tx(30,268,'sub','',Lg);
+const Llines=[];for(let i=0;i<7;i++)Llines.push(tx(30,288+i*14,'mono','',Lg));
+el('line',{x1:30,y1:392,x2:200,y2:392,stroke:'var(--line)'},Lg);
+el('circle',{cx:210,cy:410,r:6,class:'port'},Lg);
+tx(30,408,'sub tcpc','ServerSocket :7000',Lg);
+const Lsrv=tx(30,428,'status','',Lg);
+
+// nó
+const Ng=el('g',{class:'fade'});
+el('rect',{x:300,y:120,width:200,height:190,rx:10,class:'box'},Ng);
+const Nhdr=el('path',{d:'M300 130 a10 10 0 0 1 10 -10 h180 a10 10 0 0 1 10 10 v16 h-200 z',class:'hdr-n'},Ng);
+tx(312,138,'hdrtxt','daemon Kubo · API 5001',Ng);
+const Nlines=[0,1,2,3,4,5,6].map(k=>tx(312,166+k*18,'nline','',Ng));
+
+// réplicas
+const R=RY.map((y,i)=>{
+  const g=el('g',{class:'fade'});
+  el('rect',{x:660,y,width:228,height:138,rx:10,class:'box'},g);
+  const hdr=el('path',{d:`M660 ${y+10} a10 10 0 0 1 10 -10 h208 a10 10 0 0 1 10 10 v16 h-228 z`,class:'hdr-r'},g);
+  tx(672,y+18,'hdrtxt',`PartitionReplica ${i+1} 0`,g);
+  const badgeBg=el('rect',{x:800,y:y+5,width:82,height:17,rx:8.5,class:'badge-bad-bg',opacity:0},g);
+  const badge=tx(841,y+18,'badge-ok','',g,'middle');
+  const stat=tx(672,y+42,'status','',g);
+  const last=tx(878,y+42,'sub','',g,'end');
+  const addr=tx(672,y+58,'sub','',g);
+  const conns=tx(878,y+58,'sub tcpc','',g,'end');
+  const heldLbl=tx(672,y+78,'sub','',g);
+  const chips=el('g',{},g);
+  const fh=tx(672,y+97,'sub','',g);
+  const lines=[0,1,2].map(k=>tx(672,y+110+k*12,'mono','',g));
+  return {g,hdr,badge,badgeBg,stat,last,addr,conns,heldLbl,chips,fh,lines,y};
+});
+const pkLayer=el('g',{});
+
+/* ---------- estado ---------- */
+let S=null;
+function freshState(){
+  return {diff:false,
+    P:{cli:'',status:'',ready:false,count:0},
+    N:{up:true,msgs:0},
+    L:{up:false,seq:0,file:[],status:'parado',srv:'—',busy:false},
+    reps:[1,2,3].map(id=>({id,sub:false,last:0,file:[],held:new Map(),addr:null,stat:'parada',q:0,busy:false,
+      chain:Promise.resolve(),conns:0,recovered:0,perda:0,descartar:null,drops:0}))};
+}
+const now=()=>performance.now();
+const short=s=>s.replace(/;\d{4}-\d\d-\d\dT/,';');
+const seqOf=s=>+s.split(';')[0];
+function render(){
+  if(!S)return;
+  const t=now(),P=S.P,L=S.L;
+  const c='> '+P.cli;
+  Pcli.textContent=(c.length>24?'…'+c.slice(-23):c)+((Math.floor(t/500)%2&&P.ready)?'▌':'');
+  Pstat.textContent=P.ready?P.status:'(ainda não arrancou)';
+  Pcount.textContent=P.ready?'IN publicadas: '+P.count:'';
+  Lg.setAttribute('opacity',1);Lg.setAttribute('class','fade'+(L.up?'':' down'));
+  Lhdr.setAttribute('class',L.up?'hdr-l':'hdr-off');
+  Lseq.textContent='seq = '+L.seq;
+  Lin.textContent='entrada: '+L.status;Lin.setAttribute('class','status'+(L.up?'':' bad'));
+  Lfh.textContent='lider-p0.txt · '+L.file.length+(L.file.length===1?' linha':' linhas');
+  const lf=L.file.slice(-7);
+  Llines.forEach((e,i)=>{const r=lf[i];e.textContent=r?short(r.s):'';e.setAttribute('class','mono'+(r&&t-r.t<1600?' fresh-l':''));});
+  Lsrv.textContent=L.srv;Lsrv.setAttribute('class','status'+(L.busy?' busy':''));
+  const subs=S.reps.filter(r=>r.sub).map(r=>'R'+r.id);
+  [['rep02-in-p0',false],['  subscritor: '+(L.up?'líder 0':'—'),!L.up],['rep02-p0',false],['  subscritores: '+(subs.length?subs.join(' '):'—'),!subs.length],
+   ['',false],['mensagens tratadas: '+S.N.msgs,false],['',false]]
+   .forEach(([s,off],k)=>{Nlines[k].textContent=s;Nlines[k].setAttribute('class','nline'+(off?' off':''));});
+  pNL.setAttribute('class',L.up?'stream-l':'link');
+  S.reps.forEach((r,i)=>{
+    const v=R[i];
+    v.g.setAttribute('class','fade'+(r.sub?'':' down'));
+    v.hdr.setAttribute('class',r.sub?'hdr-r':'hdr-off');
+    v.stat.textContent=r.stat+(r.q?' · por ler: '+r.q:'');
+    v.stat.setAttribute('class','status'+(!r.sub?' bad':r.busy?' busy':''));
+    v.last.textContent=r.sub?'último = '+r.last:'';
+    v.addr.textContent='líder: '+(r.addr||'desconhecido');
+    v.conns.textContent=r.conns?'TCP ×'+r.conns:'';
+    v.fh.textContent='replica-'+r.id+'-p0.txt · '+r.file.length+(r.file.length===1?' linha':' linhas');
+    const ff=r.file.slice(-3);
+    v.lines.forEach((e,k)=>{const x=ff[k];e.textContent=x?short(x.s):'';e.setAttribute('class','mono'+(x&&t-x.t<1600?(x.tcp?' fresh-t':' fresh'):''));});
+    pNR[i].setAttribute('class',r.sub?'stream':'link');
+    if(S.diff){
+      const same=r.file.length===L.file.length&&r.file.every((x,k)=>x.s===L.file[k].s);
+      v.badge.textContent=same?'= líder':'≠ líder';v.badge.setAttribute('class',same?'badge-ok':'badge-bad');v.badgeBg.setAttribute('opacity',same?0:1);
+    }else{v.badge.textContent='';v.badgeBg.setAttribute('opacity',0);}
+    while(v.chips.firstChild)v.chips.firstChild.remove();
+    const keys=[...r.held.keys()].sort((a,b)=>a-b);
+    v.heldLbl.textContent=keys.length?`retidos ${keys.length}${keys.length>LIMITE?' > ':' / '}${LIMITE}`:'retidos 0';
+    v.heldLbl.setAttribute('class','sub'+(keys.length>LIMITE?' tcpc':''));
+    keys.slice(0,5).forEach((k,j)=>{const x=752+j*21;el('rect',{x,y:v.y+67,width:19,height:15,rx:4,class:'chip'},v.chips);tx(x+9.5,v.y+78,'chiptxt',String(k),v.chips,'middle');});
+    if(keys.length>5)tx(752+5*21+1,v.y+78,'chiptxt','…'+keys[keys.length-1],v.chips);
+  });
+}
+function loop(){try{render();}catch(e){console.error(e);}requestAnimationFrame(loop);}
+
+/* ---------- consolas e inspetor ---------- */
+const logEl=document.getElementById('log');
+const TAG={P:['PROD','t-P'],L:['LÍDER','t-L'],R1:['R1','t-R'],R2:['R2','t-R'],R3:['R3','t-R'],N:['NÓ','t-N']};
+function log(who,msg,kind){
+  const li=document.createElement('li');if(kind)li.className=kind;
+  const b=document.createElement('b');b.className=TAG[who][1];b.textContent=TAG[who][0];
+  const s=document.createElement('span');s.textContent=msg;li.append(b,s);logEl.append(li);
+  while(logEl.children.length>500)logEl.firstChild.remove();
+  logEl.scrollTop=logEl.scrollHeight;
+}
+const insMsg=document.getElementById('insMsg'),insTcp=document.getElementById('insTcp'),insRule=document.getElementById('insRule');
+const setMsg=s=>insMsg.textContent=s, setTcp=s=>insTcp.textContent=s, setRule=s=>insRule.textContent=s;
+
+/* ---------- motor de tempo ---------- */
+let runId=0,playing=true,stepping=false,speed=1,stepWaiter=null,stepNo=0;
+class Cancel extends Error{}
+const frame=()=>new Promise(r=>requestAnimationFrame(r));
+const running=()=>playing||stepping;
+function guard(id){if(id!==runId)throw new Cancel();}
+async function sleep(ms,id){let t=0,last=now();while(t<ms){await frame();guard(id);const n=now();if(running())t+=(n-last)*speed;last=n;}}
+async function beat(title,text,code,id){
+  guard(id);stepNo++;
+  document.getElementById('stepno').textContent=stepNo;
+  document.getElementById('ctitle').textContent=title;
+  document.getElementById('ctext').textContent=text;
+  document.getElementById('ccode').textContent=code||'';
+  if(playing&&!stepping){await sleep(Math.max(1900,text.length*32),id);}
+  else{stepping=false;await new Promise(r=>stepWaiter=r);stepWaiter=null;guard(id);stepping=!playing;}
+}
+async function fly(path,label,id,{dur=800,kind='pk',reverse=false}={}){
+  const g=el('g',{class:kind},pkLayer);
+  if(kind==='pk')el('circle',{r:12},g);
+  else{const w=Math.max(30,label.length*6.6+14);el('rect',{x:-w/2,y:-10,width:w,height:20,rx:10},g);}
+  tx(0,4,'',label,g);
+  const L=path.getTotalLength();let p=0,last=now();
+  try{while(p<1){await frame();guard(id);const n=now();if(running())p+=(n-last)*speed/dur;last=n;
+      const f=Math.min(p,1);const pt=path.getPointAtLength((reverse?1-f:f)*L);g.setAttribute('transform',`translate(${pt.x},${pt.y})`);}}
+  finally{g.remove();}
+}
+const pend=new Set();
+function track(p){const q=p.catch(e=>{if(!(e instanceof Cancel))console.error(e);});pend.add(q);q.then(()=>pend.delete(q));return p;}
+async function settle(id){
+  for(;;){await Promise.all([...pend,...S.reps.map(r=>r.chain)]);guard(id);await frame();guard(id);
+    if(!pend.size&&S.reps.every(r=>!r.q&&!r.busy))return;}
+}
+
+/* ---------- registos ---------- */
+const T0=Date.UTC(2026,9,1,10,15,0);
+let tick=0;
+function mkLine(seq,s,t){tick++;return `${seq};${s};${t.toFixed(1)};${new Date(T0+tick*3000).toISOString().slice(0,19)}`;}
+const RECS=[['S01',21.5],['S02',19.8],['S01',21.7],['S03',23.1],['S02',20.0],['S01',21.9],['S03',22.8],['S02',20.4],['S01',22.0],['S03',23.4],['S02',20.6]];
+function mulberry(seed){let a=seed;return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+let rnd=mulberry(7),rndLoss=mulberry(3);   // fontes separadas: produtor e perdas simuladas
+function append(file,s,tcp){file.push({s,t:now(),tcp:!!tcp});}
+
+/* ---------- réplica: thread de subscrição ---------- */
+function arrive(r,rec,id){
+  r.q++;
+  r.chain=r.chain.then(async()=>{r.q--;guard(id);if(!r.sub)return;await onReg(r,rec,id);})
+    .catch(e=>{if(!(e instanceof Cancel))console.error(e);});
+}
+function drain(r,who,quiet){
+  while(r.held.has(r.last+1)){const x=r.held.get(r.last+1);r.held.delete(r.last+1);append(r.file,x);r.last++;if(!quiet)log(who,'Aplicado (estava retido): '+x);}
+}
+async function onReg(r,rec,id){
+  const who='R'+r.id,seq=rec.seq,q=S.quiet;
+  if(r.descartar===seq){r.descartar=null;r.drops++;log(who,'DESCARTADO (simulação): '+seq,'warn');setRule(`R${r.id} · REG ${seq}\n→ descartado antes de ser aplicado\n  (-Ddescartar=${seq})`);return;}
+  if(r.perda&&rndLoss()<r.perda){r.drops++;log(who,'DESCARTADO (simulação): '+seq,'warn');return;}
+  r.addr=rec.addr+':'+rec.port;
+  if(seq<=r.last||r.held.has(seq)){log(who,'DUPLICADO: '+seq,'warn');setRule(`R${r.id} · REG ${seq}\nseq ≤ último (${r.last}) ou já retido\n→ ignora (duplicado)`);}
+  else if(seq===r.last+1){append(r.file,rec.line);r.last=seq;if(!q)log(who,'Aplicado: '+rec.line);
+    const before=r.held.size;drain(r,who,q);
+    setRule(`R${r.id} · REG ${seq}\nseq = último + 1\n→ escreve no ficheiro`+(before?`\n→ e escreve ${before-r.held.size} retidos`:''));}
+  else{r.held.set(seq,rec.line);log(who,`EM ESPERA: ${seq} (falta o registo ${r.last+1})`,'warn');
+    setRule(`R${r.id} · REG ${seq}\nseq > último + 1 (${r.last+1})\n→ retém em memória\n  retidos = ${r.held.size}${r.held.size>LIMITE?' > ':' ≤ '}LIMITE_RETIDOS (${LIMITE})`);}
+  if(r.held.size>LIMITE)await recover(r,id);
+}
+async function recover(r,id){
+  const i=r.id-1,who='R'+r.id,L=S.L;
+  const from=r.last+1,to=Math.min(...r.held.keys())-1;
+  r.busy=true;r.conns++;r.stat='a recuperar por TCP';
+  pTCP[i].classList.add('on');
+  log(who,`RECUPERAÇÃO: ${from}..${to} pedida a ${r.addr}`,'tcp');
+  setRule(`R${r.id} · retidos = ${r.held.size} > ${LIMITE}\n→ pede de último + 1 (${from})\n  até menor retido − 1 (${to})`);
+  let tr=`R${r.id} → ${r.addr}\nconnect(…, T_TCP_MS)\n→ PEDIDO ${from} ${to}\n`;setTcp(tr);
+  try{
+    await fly(pTCP[i],`PEDIDO ${from} ${to}`,id,{kind:'tcpq',dur:1000});
+    while(L.busy)await sleep(60,id);           // o líder atende uma ligação de cada vez
+    L.busy=true;L.srv=`a atender R${r.id}`;
+    const top=Math.min(to,L.seq);
+    const recs=L.file.filter(x=>{const s=seqOf(x.s);return s>=from&&s<=top;});
+    log('L',`RECUPERAÇÃO: ${from}..${top} para 127.0.0.1:${52000+r.id*37+r.conns} (${recs.length} registos)`,'tcp');
+    const applyOne=x=>{const s=seqOf(x.s);if(s===r.last+1){append(r.file,x.s,true);r.last=s;r.recovered++;log(who,'RECUPERADO: '+s,'tcp');}};
+    if(recs.length<=4){
+      for(const x of recs){await fly(pTCP[i],String(seqOf(x.s)),id,{kind:'tcpr',dur:650,reverse:true});tr+='← '+x.s+'\n';setTcp(tr);applyOne(x);}
+    }else{
+      await fly(pTCP[i],recs.length+' registos',id,{kind:'tcpr',dur:1100,reverse:true});
+      recs.slice(0,3).forEach(x=>tr+='← '+x.s+'\n');tr+=`← … (${recs.length} linhas no total)\n`;setTcp(tr);
+      recs.forEach(applyOne);
+    }
+    await fly(pTCP[i],'FIM',id,{kind:'tcpr',dur:550,reverse:true});
+    tr+='← FIM   (o líder fecha a ligação)';setTcp(tr);
+    L.busy=false;L.srv='accept() à espera';
+    const before=r.held.size;drain(r,who,S.quiet);
+    setRule(`R${r.id} · recuperação concluída\n→ ${recs.length} registos por TCP\n→ ${before-r.held.size} retidos escritos\n  retidos agora = ${r.held.size}`);
+  }finally{pTCP[i].classList.remove('on');r.busy=false;if(r.sub)r.stat='subscribe() bloqueado';}
+}
+
+/* ---------- produtor → líder → réplicas ---------- */
+async function typeCLI(s,id,ms=50){S.P.status='a ler da CLI';for(const c of s){S.P.cli+=c;await sleep(ms,id);}await sleep(220,id);}
+function fanout(rec,id,dur){
+  return Promise.all(S.reps.map((r,i)=>r.sub?fly(pNR[i],String(rec.seq),id,{dur:(700+i*60)*dur}).then(()=>{if(r.sub)arrive(r,rec,id);}):null).filter(Boolean));
+}
+async function produce(s,t,id,opt={}){
+  const dur=opt.dur||1,P=S.P,quiet=opt.quiet;
+  if(!opt.noType)await typeCLI(`${s} ${t.toFixed(1)}`,id,opt.fastType?18:50);
+  const msg=`IN;${s};${t.toFixed(1)}`;
+  P.count++;P.status='publica no tópico de entrada';
+  if(!quiet){log('P','Publicado em rep02-in-p0: '+msg);setMsg(`tópico rep02-in-p0\n\n${msg}\n\n(sem número de sequência: o\n produtor não conhece o líder)`);}
+  if(opt.beats)await beat('O produtor publica uma leitura','O produtor não numera nem conhece o líder. Publica IN;S01;21.5 no tópico de entrada da partição 0 e volta a ler da CLI.',msg,id);
+  const job=(async()=>{
+    await fly(pPN,'IN',id,{kind:'pill',dur:520*dur});
+    S.N.msgs++;
+    if(!S.L.up){log('N','rep02-in-p0 sem subscritores: mensagem descartada','warn');return;}
+    await fly(pNL,'IN',id,{kind:'pill',dur:460*dur});
+    const L=S.L,seq=++L.seq,line=mkLine(seq,s,t);
+    append(L.file,line);
+    if(!quiet)log('L','Registado e publicado: '+line);
+    const rec={seq,line,addr:ADDR,port:PORT},reg=`REG;${ADDR};${PORT};${line}`;
+    if(!quiet)setMsg(`tópico rep02-p0\n\n${reg}\n    └──┬───┘ └┬─┘\n   endereço  porto de recuperação`);
+    if(opt.beats)await beat('O líder numera, escreve e só depois propaga',`Atribui o seq ${seq} e acrescenta o registo a lider-p0.txt na mesma secção sincronizada. Só então publica REG no tópico de dados, com o endereço e o porto onde aceita pedidos de recuperação.`,reg,id);
+    await fly(pLN,'REG '+seq,id,{kind:'reg',dur:460*dur});
+    S.N.msgs++;
+    await fanout(rec,id,dur);
+  })();
+  track(job);
+  if(opt.noWait)await sleep(opt.gap||150,id);else await job;
+  P.cli='';P.status='hasNextLine() à espera';
+}
+async function rajada(n,s,id,opt={}){
+  await typeCLI(`rajada ${n} ${s}`,id);
+  const t0=Math.round(T0/1000)*1000+123456;
+  log('P',`rajada ${n} ${s}: primeira publicação em ${t0}`);
+  for(let k=0;k<n;k++){
+    const sensor='S'+String(1+Math.floor(rnd()*s)).padStart(2,'0');const temp=15+Math.round(rnd()*150)/10;
+    await produce(sensor,temp,id,{noType:true,noWait:true,quiet:true,dur:.55,gap:opt.gap||170});
+  }
+  log('P',`rajada ${n} ${s}: última publicação em ${t0+n*3}`);
+  S.P.cli='';
+}
+
+/* ---------- arranque dos processos ---------- */
+async function subRep(r,id,quiet){
+  const i=r.id-1;
+  await fly(pNR[i],'sub',id,{kind:'sreq',dur:600,reverse:true});
+  r.sub=true;r.stat='subscribe() bloqueado';
+  if(!quiet)log('R'+r.id,`Réplica ${r.id} subscreve rep02-p0  (lastSeq() = ${r.last})`);
+}
+async function subLeader(id){
+  await fly(pNL,'sub',id,{kind:'sreq',dur:520,reverse:true});
+  const L=S.L;L.up=true;L.status='subscribe() bloqueado';L.srv='accept() à espera';
+  log('L',`Líder p0: lastSeq() = ${L.seq}, subscreve rep02-in-p0, à escuta em ${ADDR}:${PORT}`);
+}
+function prefill(n){
+  for(let k=1;k<=n;k++){const [s,t]=RECS[(k-1)%RECS.length];const line=mkLine(k,s,t);S.L.file.push({s:line,t:0});S.reps.forEach(r=>{r.file.push({s:line,t:0});r.last=k;r.addr=ADDR+':'+PORT;});}
+  S.L.seq=n;
+}
+function liveAll(){
+  const L=S.L;L.up=true;L.status='subscribe() bloqueado';L.srv='accept() à espera';
+  S.reps.forEach(r=>{r.sub=true;r.stat='subscribe() bloqueado';});
+  S.P.ready=true;S.P.status='hasNextLine() à espera';
+}
+function stopRep(r){r.sub=false;r.held.clear();r.addr=null;r.stat='parada (processo terminado)';log('R'+r.id,'^C  (processo terminado)','warn');}
+const rec=k=>RECS[(k-1)%RECS.length];
+
+/* ---------- cenários ---------- */
+const SC={
+A:async id=>{
+  log('N','Daemon is ready  (API 5001, Pubsub.Enabled = true)');
+  await beat('Uma partição, um líder','Nesta parte só existe a partição 0. Arrancam primeiro as réplicas, que subscrevem rep02-p0, depois o líder e por fim o produtor.','java -cp out rep02.PartitionReplica 1 0     # e 2, e 3\njava -cp out rep02.PartitionLeader 0 1\njava -cp out rep02.Producer',id);
+  for(const r of S.reps)await subRep(r,id);
+  await subLeader(id);
+  await beat('O líder tem duas atividades','Uma thread subscreve rep02-in-p0 e trata as leituras que chegam. A thread principal fica bloqueada em accept() no porto 7000, à espera de pedidos de recuperação.','',id);
+  S.P.ready=true;S.P.status='hasNextLine() à espera';log('P',"Produtor pronto. Formato: <sensor> <temperatura> | rajada <n> <s> | 'sair'");
+  await produce(...rec(1),id,{beats:true});
+  await settle(id);
+  await beat('As réplicas aprendem onde está o líder','Cada réplica aplica o registo com a regra da COMINDIR01 e guarda o endereço e o porto anunciados. Não os tinha na sua configuração.','',id);
+  await beat('Mais quatro leituras','O mesmo ciclo. Sem perdas, nenhuma réplica retém registos e a ligação TCP nunca é usada.','',id);
+  for(let k=2;k<=5;k++)await produce(...rec(k),id);
+  await settle(id);S.diff=true;
+  await beat('Comparar os ficheiros','Os quatro ficheiros têm as mesmas cinco linhas.','diff lider-p0.txt replica-1-p0.txt',id);
+},
+B:async id=>{
+  prefill(5);liveAll();
+  await beat('Ponto de partida','Os quatro ficheiros têm os registos 1 a 5 e as três réplicas conhecem o endereço do líder.','',id);
+  const r2=S.reps[1];stopRep(r2);
+  await beat('A réplica 2 pára','Com o processo perde-se também o que estava em memória: os registos retidos e o endereço do líder.','',id);
+  for(let k=6;k<=8;k++)await produce(...rec(k),id,{fastType:true});
+  await beat('R2 volta a arrancar','Lê lastSeq() de replica-2-p0.txt (5) e volta a subscrever. Ainda não sabe onde está o líder: só o aprende com a próxima mensagem REG.','long ultimo = file.lastSeq();   // 5',id);
+  await subRep(r2,id);
+  for(let k=9;k<=10;k++)await produce(...rec(k),id,{fastType:true});
+  await settle(id);S.diff=true;
+  await beat('Ainda não convergiu','R2 retém 9 e 10 à espera do 6. Com dois registos retidos não há forma de distinguir uma perda de uma entrega fora de ordem, por isso R2 ainda não pede nada.',`retidos = ${r2.held.size}  ≤  LIMITE_RETIDOS = ${LIMITE}`,id);
+  await beat('Mais leituras, uma de cada vez','Cada leitura nova fica retida em R2. A contagem sobe até ultrapassar LIMITE_RETIDOS.','',id);
+  let k=11;
+  while(r2.conns===0){await produce(...rec(k),id,{fastType:true,dur:.7});await settle(id);k++;}
+  const trig=S.L.seq;
+  await beat(`A leitura ${trig} desencadeou o pedido`,`Com o registo ${trig}, R2 passou a ter ${LIMITE+1} registos retidos. Ligou-se por TCP ao endereço anunciado e pediu 6..8. Depois de escrever esses três, os retidos 9 a ${trig} ficaram em sequência e foram escritos.`,'PEDIDO 6 8',id);
+  await beat('Comparar os ficheiros','R2 convergiu: o seu ficheiro é igual a lider-p0.txt.','diff lider-p0.txt replica-2-p0.txt',id);
+},
+C:async id=>{
+  prefill(5);liveAll();
+  const r3=S.reps[2];stopRep(r3);
+  log('R3','$ java -cp out -Ddescartar=6 rep02.PartitionReplica 3 0','cmd');
+  await subRep(r3,id,true);r3.descartar=6;
+  await beat('R3 vai descartar o registo 6','A réplica 3 volta a arrancar com -Ddescartar=6. A primeira vez que o registo 6 chegar pelo PubSub, R3 deita-o fora antes de o aplicar.','java -cp out -Ddescartar=6 rep02.PartitionReplica 3 0',id);
+  await produce(...rec(6),id);
+  await settle(id);S.diff=true;
+  await beat('Nada denuncia a falta','R3 não tem nenhum registo retido nem sabe que existe um 6. O ficheiro fica no 5 e a réplica não pede nada.','',id);
+  await beat('Leituras adicionais, uma de cada vez','Introduzem-se mais leituras até que R3 convirja.','',id);
+  let k=7;
+  while(r3.conns===0){await produce(...rec(k),id,{fastType:true,dur:.7});await settle(id);k++;}
+  await beat(`Foram precisas ${S.L.seq-6} leituras adicionais`,`R3 só recuperou o registo 6 quando ficou com ${LIMITE+1} registos retidos (7 a ${S.L.seq}). Se nenhuma leitura se tivesse seguido ao 6, o ficheiro de R3 ficaria no 5.`,'PEDIDO 6 6',id);
+},
+D:async id=>{
+  rnd=mulberry(11);rndLoss=mulberry(5);
+  prefill(5);liveAll();
+  const r3=S.reps[2];stopRep(r3);
+  log('R3','$ java -cp out -Dperda=0.2 rep02.PartitionReplica 3 0','cmd');
+  await subRep(r3,id,true);r3.perda=.2;
+  await beat('R3 com -Dperda=0.2','Cada REG que chega a R3 pelo PubSub é descartado com probabilidade 0,2. As outras réplicas recebem tudo.','java -cp out -Dperda=0.2 rep02.PartitionReplica 3 0',id);
+  await beat('rajada 60 10','O produtor publica as leituras sem pausas. Aqui são 60 para caberem no ecrã; na ficha são 1000. Enquanto R3 está ligada ao líder por TCP, a thread de subscrição não lê o stream do PubSub: o contador «por ler» mostra as mensagens que vão chegando entretanto.','rajada 60 10',id);
+  S.quiet=true;
+  await rajada(60,10,id);
+  await settle(id);S.quiet=false;S.diff=true;
+  S.reps.forEach(r=>log('R'+r.id,`fim: ${r.file.length} registos escritos · ligações de recuperação ${r.conns} · obtidos por TCP ${r.recovered} · retidos ${r.held.size}`,r.held.size?'warn':''));
+  await beat('Contar o que chegou',`R3 descartou ${r3.drops} mensagens, abriu ${r3.conns} ligações e obteve ${r3.recovered} registos por TCP. No fim tem ${r3.held.size} retidos e faltam-lhe ${S.L.file.length-r3.file.length} registos. Os valores para o ponto 16 são os que medir.`,'diff lider-p0.txt replica-3-p0.txt',id);
+},
+E:async id=>{
+  rnd=mulberry(23);
+  prefill(30);liveAll();
+  const r3=S.reps[2];stopRep(r3);
+  log('R3','$ rm replica-3-p0.txt','cmd');r3.file=[];r3.last=0;
+  await beat('Uma réplica sem histórico','R3 parou e o seu ficheiro foi apagado. Ao voltar a arrancar, lastSeq() devolve 0. O líder já tem 30 registos.','rm replica-3-p0.txt',id);
+  await subRep(r3,id);
+  await beat('rajada 20 10','R3 retém tudo o que recebe, porque lhe falta o registo 1. À décima primeira mensagem retida recupera, numa só ligação, todo o histórico anterior.','rajada 20 10',id);
+  S.quiet=true;
+  await rajada(20,10,id,{gap:260});
+  await settle(id);S.quiet=false;S.diff=true;
+  await beat('Comparar os ficheiros',`R3 abriu ${r3.conns} ligação e recebeu ${r3.recovered} registos por TCP. Os seguintes chegaram pelo PubSub.`,'diff lider-p0.txt replica-3-p0.txt',id);
+}
+};
+
+/* ---------- controlo ---------- */
+let current='A';
+async function run(sc){
+  runId++;const id=runId;stepNo=0;stepping=false;tick=0;rnd=mulberry(7);rndLoss=mulberry(3);
+  if(stepWaiter){const w=stepWaiter;stepWaiter=null;w();}
+  while(pkLayer.firstChild)pkLayer.firstChild.remove();
+  pTCP.forEach(p=>p.classList.remove('on'));
+  pend.clear();
+  logEl.textContent='';setMsg('—');setTcp('—');setRule('—');
+  S=freshState();
+  try{await SC[sc](id);
+    if(id===runId){await sleep(200,id);document.getElementById('ctitle').textContent+=' · fim do cenário';}
+  }catch(e){if(!(e instanceof Cancel))console.error(e);}
+}
+const playBtn=document.getElementById('play');
+function syncPlay(){playBtn.textContent=playing?'❚❚ Pausa':'▶ Reproduzir';}
+playBtn.onclick=()=>{playing=!playing;stepping=false;if(playing&&stepWaiter)stepWaiter();syncPlay();};
+document.getElementById('step').onclick=()=>{if(playing){playing=false;syncPlay();}if(stepWaiter)stepWaiter();else stepping=true;};
+document.getElementById('restart').onclick=()=>run(current);
+document.getElementById('speed').onchange=e=>speed=parseFloat(e.target.value);
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+  current=b.dataset.sc;document.querySelectorAll('.tab').forEach(x=>x.setAttribute('aria-pressed',x===b));run(current);});
+try{if(matchMedia('(prefers-reduced-motion: reduce)').matches)playing=false;}catch(e){}
+syncPlay();
+S=freshState();
+requestAnimationFrame(loop);
+run('A');
+})();
+</script>
+</body>
+</html>
+
+
+=== C:\Users\User\Desktop\StD-2026-2027_Extra2\Sprints\E1-COMINDIR02\ilustração parte B.html ===
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Particionamento com PubSub</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Base partilhada com a Parte A */
+:root{
+  --bg:#ecf0f3; --panel:#ffffff; --ink:#17202b; --muted:#5b6876; --line:#c5ced8;
+  --prod:#4f6b16; --leader:#2a54b5; --net:#b06a0a; --rep:#17786b; --node:#6a45a8; --node-soft:#efe8f8;
+  --tcp:#b0306f; --tcp-soft:#f9e3ee; --bad:#b5372c; --chip:#f7e6c8; --chip-ink:#6b4100;
+  --cli:#1d2733; --cli-ink:#d9e4ee; --soft:#f5f7f9;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#10151b; --panel:#19212a; --ink:#e2e8ee; --muted:#92a0ae; --line:#33404d;
+  --prod:#a9c46a; --leader:#86a6f2; --net:#e3a44c; --rep:#52c2b0; --node:#b393ea; --node-soft:#2a2238;
+  --tcp:#f07fb5; --tcp-soft:#3a1f2d; --bad:#f07f73; --chip:#4a3a1e; --chip-ink:#f6d9a6;
+  --cli:#0b0f14; --cli-ink:#d9e4ee; --soft:#141b22; color-scheme:dark }}
+:root[data-theme="dark"]{
+  --bg:#10151b; --panel:#19212a; --ink:#e2e8ee; --muted:#92a0ae; --line:#33404d;
+  --prod:#a9c46a; --leader:#86a6f2; --net:#e3a44c; --rep:#52c2b0; --node:#b393ea; --node-soft:#2a2238;
+  --tcp:#f07fb5; --tcp-soft:#3a1f2d; --bad:#f07f73; --chip:#4a3a1e; --chip-ink:#f6d9a6;
+  --cli:#0b0f14; --cli-ink:#d9e4ee; --soft:#141b22; color-scheme:dark }
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1120px;margin:0 auto;padding-inline:16px;padding-block:28px 48px;display:grid;gap:18px}
+header{display:grid;gap:6px}
+.eyebrow{font-family:var(--f-mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--f-display);font-weight:700;font-size:clamp(28px,4.5vw,42px);line-height:1.05;margin:0;text-wrap:balance}
+h1 span{color:var(--tcp)}
+.lede{margin:0;max-width:72ch;color:var(--muted)}
+.tabs{display:flex;flex-wrap:wrap;gap:8px}
+.tab{font:500 14px/1.2 var(--f-body);color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:8px 14px;cursor:pointer;display:flex;gap:8px;align-items:baseline}
+.tab small{font-family:var(--f-mono);font-size:11px;color:var(--muted)}
+.tab[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.tab[aria-pressed="true"] small{color:var(--bg);opacity:.75}
+.tab:focus-visible,.btn:focus-visible,select:focus-visible{outline:2px solid var(--node);outline-offset:2px}
+.bench{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.caption{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;padding:16px 18px;border-bottom:1px solid var(--line);min-height:128px}
+.stepno{font-family:var(--f-display);font-weight:700;font-size:34px;line-height:1;color:var(--tcp);grid-row:span 3;font-variant-numeric:tabular-nums;min-width:2ch}
+.ctitle{font-family:var(--f-display);font-weight:600;font-size:20px;margin:0;text-wrap:balance}
+.ctext{margin:0;max-width:78ch;min-width:0}
+.ccode{font-family:var(--f-mono);font-size:12.5px;background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:4px 8px;justify-self:start;max-width:100%;overflow-x:auto;white-space:pre;margin-top:4px}
+.ccode:empty{display:none}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--soft)}
+.btn{font:500 14px/1 var(--f-body);background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:9px 14px;cursor:pointer}
+.btn.primary{background:var(--leader);color:var(--panel);border-color:var(--leader)}
+.controls label{font-size:13px;color:var(--muted);display:flex;gap:6px;align-items:center;margin-left:auto}
+select{font:14px var(--f-body);background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px}
+.stagewrap{overflow-x:auto}
+#stage{display:block;width:100%;min-width:680px;height:auto}
+.inspector{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line)}
+.inspector div{padding:12px 16px;min-width:0;border-right:1px solid var(--line)}
+.inspector div:last-child{border-right:0}
+.inspector h3{margin:0 0 4px;font:600 12px var(--f-body);letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.inspector pre{margin:0;font:11.5px/1.5 var(--f-mono);white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
+@media (max-width:760px){.inspector{grid-template-columns:1fr}.inspector div{border-right:0;border-bottom:1px solid var(--line)}}
+/* SVG */
+.box{fill:var(--panel);stroke:var(--line);stroke-width:1.2}
+.hdr-l{fill:var(--leader)} .hdr-r{fill:var(--rep)} .hdr-n{fill:var(--node)} .hdr-p{fill:var(--prod)} .hdr-off{fill:var(--muted)}
+.hdrtxt{fill:var(--panel);font:600 13px var(--f-display);letter-spacing:.02em}
+.sub{fill:var(--muted);font:11px var(--f-mono)}
+.sub.tcpc{fill:var(--tcp);font-weight:600}
+.lbl{fill:var(--ink);font:500 12px var(--f-body)}
+.mono{fill:var(--ink);font:10.5px var(--f-mono)}
+.mono.fresh{fill:var(--rep);font-weight:600}
+.mono.fresh-l{fill:var(--leader);font-weight:600}
+.mono.fresh-t{fill:var(--tcp);font-weight:600}
+.nline{fill:var(--ink);font:10.5px var(--f-mono)}
+.nline.off{fill:var(--muted)}
+.clibg{fill:var(--cli)}
+.clitxt{fill:var(--cli-ink);font:12px var(--f-mono)}
+.badge-ok{fill:var(--panel);font:600 11px var(--f-mono)}
+.badge-bad{fill:#fff;font:600 11px var(--f-mono)}
+.badge-bad-bg{fill:var(--bad)}
+.link{fill:none;stroke:var(--line);stroke-width:2;stroke-dasharray:4 5}
+.stream{fill:none;stroke:var(--rep);stroke-width:2.2}
+.stream-l{fill:none;stroke:var(--leader);stroke-width:2.2}
+.http{fill:none;stroke:var(--prod);stroke-width:2;stroke-dasharray:2 4}
+.http-l{fill:none;stroke:var(--leader);stroke-width:2;stroke-dasharray:2 4}
+.tcp{fill:none;stroke:var(--tcp);stroke-width:1.6;stroke-dasharray:6 5;opacity:.35}
+.tcp.on{stroke-width:2.8;stroke-dasharray:none;opacity:1}
+.tcptxt{fill:var(--tcp);font:600 11px var(--f-display);letter-spacing:.05em}
+.port{fill:var(--tcp-soft);stroke:var(--tcp);stroke-width:1.5}
+.chip{fill:var(--chip);stroke:var(--net);stroke-width:1}
+.chiptxt{fill:var(--chip-ink);font:600 10px var(--f-mono)}
+.down rect.box{stroke-dasharray:5 4;opacity:.7}
+.status{font:500 11.5px var(--f-body);fill:var(--muted)}
+.status.bad{fill:var(--bad)}
+.status.busy{fill:var(--tcp);font-weight:600}
+.pk circle{fill:var(--net);stroke:var(--panel);stroke-width:2}
+.pk text{fill:#fff;font:600 10.5px var(--f-mono);text-anchor:middle}
+.pill rect{fill:var(--prod);stroke:var(--panel);stroke-width:2}
+.pill text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.reg rect{fill:var(--leader);stroke:var(--panel);stroke-width:2}
+.reg text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.sreq rect{fill:var(--rep);stroke:var(--panel);stroke-width:2}
+.sreq text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.tcpq rect{fill:var(--tcp);stroke:var(--panel);stroke-width:2}
+.tcpq text{fill:var(--panel);font:600 10.5px var(--f-mono);text-anchor:middle}
+.tcpr rect{fill:var(--panel);stroke:var(--tcp);stroke-width:1.8}
+.tcpr text{fill:var(--tcp);font:600 10.5px var(--f-mono);text-anchor:middle}
+.fade{transition:opacity .4s}
+/* consolas */
+.logs{display:grid;gap:8px}
+.logs h2{font-family:var(--f-display);font-weight:600;font-size:16px;margin:0;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+.logs h2 span{font:12px var(--f-body);color:var(--muted)}
+#log{list-style:none;margin:0;padding:10px 0;background:var(--cli);color:var(--cli-ink);border-radius:10px;font:12.5px/1.55 var(--f-mono);height:240px;overflow:auto}
+#log li{display:grid;grid-template-columns:62px 1fr;gap:8px;padding:0 14px}
+#log li span{min-width:0;overflow-wrap:anywhere}
+#log b{font-weight:600}
+.t-P{color:#c3dc8c}.t-L{color:#8fb0ff}.t-R{color:#6fd6c4}.t-N{color:#c8a8ff}
+#log li.warn span{color:#ffb1a8}
+#log li.cmd span{color:#f2d58a}
+#log li.tcp span{color:#ff9fcb}
+.legend{display:flex;flex-wrap:wrap;gap:14px 22px;font-size:13px;color:var(--muted);margin:0;padding:0;list-style:none}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;vertical-align:-1px}
+.foot{font-size:13px;color:var(--muted);max-width:80ch;margin:0}
+@media (max-width:560px){ .caption{grid-template-columns:1fr} .stepno{grid-row:auto;font-size:26px} .controls label{margin-left:0} }
+
+/* Parte B: uma cor por partição */
+:root{--p0:#2a6fdb;--p1:#c2410c;--p2:#0f8a5f}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){--p0:#7aa7ff;--p1:#fb8c5a;--p2:#4fd1a1}}
+:root[data-theme="dark"]{--p0:#7aa7ff;--p1:#fb8c5a;--p2:#4fd1a1}
+h1 span{color:var(--p1)}
+.stepno{color:var(--p0)}
+.hdr-p0{fill:var(--p0)} .hdr-p1{fill:var(--p1)} .hdr-p2{fill:var(--p2)}
+.ptxt0{fill:var(--p0);font:600 11px var(--f-mono)} .ptxt1{fill:var(--p1);font:600 11px var(--f-mono)} .ptxt2{fill:var(--p2);font:600 11px var(--f-mono)}
+.mono.fresh0{fill:var(--p0);font-weight:600} .mono.fresh1{fill:var(--p1);font-weight:600} .mono.fresh2{fill:var(--p2);font-weight:600}
+.colsep{stroke:var(--line);stroke-width:1}
+.mark-ok{fill:var(--rep);font:600 11px var(--f-mono)} .mark-bad{fill:var(--bad);font:600 11px var(--f-mono)}
+.drop text{fill:var(--bad);font:700 16px var(--f-mono);text-anchor:middle}
+.bar{opacity:.85}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Sistemas Distribuídos · COMINDIR02 · 4.2 Parte B</div>
+    <h1>Particionamento com <span>um líder por partição</span></h1>
+    <p class="lede">N = 3 partições, R = 2. O produtor calcula a partição de cada leitura com floorMod(hashCode, 3) e publica-a no tópico de entrada dessa partição. Cada líder numera só a sua partição e propaga-a no seu tópico de dados. Cada réplica subscreve duas partições, com uma thread e um estado por partição.</p>
+  </header>
+
+  <nav class="tabs" aria-label="Cenários">
+    <button class="tab" data-sc="A" aria-pressed="true">S01 a S06 <small>ponto 12 · a</small></button>
+    <button class="tab" data-sc="B" aria-pressed="false">Rajada uniforme <small>ponto 12 · b</small></button>
+    <button class="tab" data-sc="C" aria-pressed="false">Chave quente <small>ponto 12 · c</small></button>
+    <button class="tab" data-sc="D" aria-pressed="false">Líder p1 parado <small>ponto 12 · d</small></button>
+    <button class="tab" data-sc="E" aria-pressed="false">Réplica 1 parada <small>ponto 12 · e</small></button>
+  </nav>
+
+  <section class="bench" aria-label="Animação">
+    <div class="caption" aria-live="polite">
+      <div class="stepno" id="stepno">1</div>
+      <h2 class="ctitle" id="ctitle">A preparar</h2>
+      <p class="ctext" id="ctext">A animação está a carregar.</p>
+      <div class="ccode" id="ccode"></div>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="play">❚❚ Pausa</button>
+      <button class="btn" id="step">Próximo passo ›</button>
+      <button class="btn" id="restart">↺ Recomeçar</button>
+      <label for="speed">Velocidade
+        <select id="speed"><option value="0.5">0,5×</option><option value="1" selected>1×</option><option value="1.6">1,6×</option><option value="2.5">2,5×</option></select>
+      </label>
+    </div>
+    <div class="stagewrap">
+      <svg id="stage" viewBox="0 0 900 536" role="img" aria-label="Produtor, três líderes de partição, daemon Kubo e três réplicas que guardam duas partições cada; ligações TCP de recuperação por baixo"></svg>
+    </div>
+    <div class="inspector" aria-label="Última mensagem">
+      <div><h3>Partição da leitura</h3><pre id="insMsg">—</pre></div>
+      <div><h3>Mensagem no tópico de dados</h3><pre id="insTcp">—</pre></div>
+      <div><h3>Réplicas e recuperação</h3><pre id="insRule">—</pre></div>
+    </div>
+  </section>
+
+  <section class="logs">
+    <h2>Consolas <span>o que cada programa ou comando escreve no terminal</span></h2>
+    <ul id="log"></ul>
+  </section>
+
+  <ul class="legend">
+    <li><i style="background:var(--p0)"></i>Partição 0 (rep02-in-p0, rep02-p0, porto 7000)</li>
+    <li><i style="background:var(--p1)"></i>Partição 1 (rep02-in-p1, rep02-p1, porto 7001)</li>
+    <li><i style="background:var(--p2)"></i>Partição 2 (rep02-in-p2, rep02-p2, porto 7002)</li>
+    <li><i style="background:var(--prod)"></i>Produtor</li>
+    <li><i style="background:var(--node)"></i>Daemon Kubo</li>
+    <li><i style="background:var(--tcp)"></i>Ligação TCP de recuperação</li>
+    <li><i style="background:var(--bad)"></i>Divergência ou mensagem sem subscritor</li>
+  </ul>
+  <p class="foot">A animação ilustra o comportamento descrito na ficha. As rajadas têm menos leituras do que na ficha para caberem no ecrã. Nos ficheiros desenhados, os registos aparecem abreviados. Os tempos e as contagens são encenados com um gerador pseudoaleatório fixo, não são medições: os valores reais são os que cada aluno regista nos pontos 12 e 16. No teste 12(e) a ficha arranca também a réplica 3 com -Dperda=0.2; aqui mostra-se só a paragem da réplica 1.</p>
+</div>
+
+<script>
+(function(){
+const NS='http://www.w3.org/2000/svg';
+const svg=document.getElementById('stage');
+function el(tag,attrs,parent){const e=document.createElementNS(NS,tag);for(const k in attrs)e.setAttribute(k,attrs[k]);(parent||svg).appendChild(e);return e;}
+function tx(x,y,cls,s,parent,anchor){const t=el('text',{x,y,class:cls},parent);if(anchor)t.setAttribute('text-anchor',anchor);t.textContent=s||'';return t;}
+
+const N=3, LIMITE=10, ADDR='127.0.0.1', PORTO_BASE=7000;
+const PARTS=[[0,1],[1,2],[2,0]];
+// String.hashCode() de Java e Math.floorMod
+function jhash(s){let h=0;for(const c of s)h=(Math.imul(31,h)+c.charCodeAt(0))|0;return h;}
+const floorMod=(a,n)=>((a%n)+n)%n;
+const partOf=s=>floorMod(jhash(s),N);
+const PC=k=>`var(--p${k})`;
+
+/* ---------- palco ---------- */
+const LY=[150,274,398], RY=[16,186,356];
+const links=el('g',{});
+const pPN=el('path',{d:'M210 75 C 255 75, 250 185, 290 185',class:'http'},links);
+const pNL=LY.map((ly,k)=>el('path',{d:`M290 ${196+k*18} C 250 ${196+k*18}, 250 ${ly+44}, 210 ${ly+44}`,class:'link'},links));
+const pLN=LY.map((ly,k)=>el('path',{d:`M210 ${ly+66} C 252 ${ly+66}, 255 ${268+k*18}, 290 ${268+k*18}`,class:'link'},links));
+const pNR=RY.map((y,i)=>el('path',{d:`M500 ${270+i*18} C 575 ${270+i*18}, 565 ${y+80}, 640 ${y+80}`,class:'link'},links));
+tx(250,112,'sub','HTTP',links,'middle');
+tx(415,532,'tcptxt','TCP · réplica → porto 7000 + k do líder da partição k',links,'middle');
+const tcpLayer=el('g',{});
+function tcpPath(i,k){const y=RY[i]+142,ly=LY[k]+92;
+  return el('path',{d:`M640 ${y} C 612 ${y}, 612 520, 585 520 L 248 520 C 226 520, 226 ${ly}, 210 ${ly}`,class:'tcp on',style:`stroke:${PC(k)}`},tcpLayer);}
+
+// produtor
+const Pg=el('g',{});
+el('rect',{x:20,y:16,width:190,height:120,rx:10,class:'box'},Pg);
+el('path',{d:'M20 26 a10 10 0 0 1 10 -10 h170 a10 10 0 0 1 10 10 v16 h-190 z',class:'hdr-p'},Pg);
+tx(32,34,'hdrtxt','Producer 3',Pg);
+el('rect',{x:30,y:50,width:170,height:30,rx:5,class:'clibg'},Pg);
+const Pcli=tx(38,70,'clitxt','',Pg);
+const Pstat=tx(30,100,'status','',Pg);
+const Pcnt=[0,1,2].map(k=>tx(30+k*58,124,'ptxt'+k,'',Pg));
+
+// líderes
+const LV=LY.map((ly,k)=>{
+  const g=el('g',{class:'fade'});
+  el('rect',{x:20,y:ly,width:190,height:112,rx:10,class:'box'},g);
+  const hdr=el('path',{d:`M20 ${ly+10} a10 10 0 0 1 10 -10 h170 a10 10 0 0 1 10 10 v16 h-190 z`,class:'hdr-p'+k},g);
+  tx(32,ly+18,'hdrtxt',`PartitionLeader ${k} 3`,g);
+  const seq=tx(30,ly+42,'lbl','',g);
+  tx(200,ly+42,'sub tcpc',':'+(PORTO_BASE+k),g,'end');
+  const stat=tx(30,ly+58,'status','',g);
+  const lines=[0,1,2].map(j=>tx(30,ly+76+j*13,'mono','',g));
+  el('circle',{cx:210,cy:ly+92,r:5,class:'port'},g);
+  const bar=el('rect',{x:20,y:ly+108,width:0,height:4,rx:2,class:'bar',style:`fill:${PC(k)}`},g);
+  return {g,hdr,seq,stat,lines,bar,k};
+});
+
+// nó
+const Ng=el('g',{});
+el('rect',{x:290,y:150,width:210,height:240,rx:10,class:'box'},Ng);
+el('path',{d:'M290 160 a10 10 0 0 1 10 -10 h190 a10 10 0 0 1 10 10 v16 h-210 z',class:'hdr-n'},Ng);
+tx(302,168,'hdrtxt','daemon Kubo · API 5001',Ng);
+const Nlines=[0,1,2,3,4,5,6,7,8].map(j=>tx(302,200+j*18,'nline','',Ng));
+
+// réplicas
+const RV=RY.map((y,i)=>{
+  const g=el('g',{class:'fade'});
+  el('rect',{x:640,y,width:248,height:160,rx:10,class:'box'},g);
+  const hdr=el('path',{d:`M640 ${y+10} a10 10 0 0 1 10 -10 h228 a10 10 0 0 1 10 10 v16 h-248 z`,class:'hdr-r'},g);
+  tx(652,y+18,'hdrtxt',`PartitionReplica ${i+1} ${PARTS[i].join(',')}`,g);
+  const stat=tx(652,y+42,'status','',g);
+  el('line',{x1:764,y1:y+52,x2:764,y2:y+154,class:'colsep'},g);
+  const cols=PARTS[i].map((k,c)=>{
+    const x=650+c*122;
+    const fh=tx(x,y+64,'ptxt'+k,`replica-${i+1}-p${k}.txt`,g);
+    const st=tx(x,y+79,'sub','',g);
+    const mark=tx(x+110,y+79,'mark-ok','',g,'end');
+    const held=tx(x,y+93,'sub','',g);
+    const tcp=tx(x+110,y+93,'sub tcpc','',g,'end');
+    const lines=[0,1,2,3].map(j=>tx(x,y+110+j*13,'mono','',g));
+    return {k,fh,mark,st,held,tcp,lines};
+  });
+  return {g,hdr,stat,cols,y};
+});
+const pkLayer=el('g',{});
+
+/* ---------- estado ---------- */
+let S=null;
+function pstate(){return {last:0,file:[],held:new Map(),addr:null,q:0,busy:false,chain:Promise.resolve(),conns:0,recovered:0};}
+function freshState(){
+  return {diff:false,quiet:false,msgs:0,
+    P:{cli:'',status:'',ready:false,count:[0,0,0]},
+    L:[0,1,2].map(k=>({k,up:false,seq:0,file:[],status:'parado',busy:false})),
+    reps:[1,2,3].map(id=>{const ps={};PARTS[id-1].forEach(k=>ps[k]=pstate());return {id,parts:PARTS[id-1],sub:false,stat:'parada',ps};})};
+}
+const now=()=>performance.now();
+const short=s=>s.replace(/;\d{4}-\d\d-\d\dT/,';');
+const tiny=s=>s.split(';').slice(0,3).join(';');
+const seqOf=s=>+s.split(';')[0];
+function render(){
+  if(!S)return;
+  const t=now(),P=S.P;
+  const c='> '+P.cli;
+  Pcli.textContent=(c.length>24?'…'+c.slice(-23):c)+((Math.floor(t/500)%2&&P.ready)?'▌':'');
+  Pstat.textContent=P.ready?P.status:'(ainda não arrancou)';
+  Pcnt.forEach((e,k)=>e.textContent=P.ready?`p${k}: ${P.count[k]}`:'');
+  const maxLen=Math.max(10,...S.L.map(L=>L.file.length));
+  S.L.forEach((L,k)=>{
+    const v=LV[k];
+    v.g.setAttribute('class','fade'+(L.up?'':' down'));
+    v.hdr.setAttribute('class',L.up?'hdr-p'+k:'hdr-off');
+    v.seq.textContent=`seq = ${L.seq}  ·  lider-p${k}.txt`;
+    v.stat.textContent='entrada: '+L.status;v.stat.setAttribute('class','status'+(L.up?(L.busy?' busy':''):' bad'));
+    const lf=L.file.slice(-3);
+    v.lines.forEach((e,j)=>{const r=lf[j];e.textContent=r?short(r.s):'';e.setAttribute('class','mono'+(r&&t-r.t<1600?' fresh'+k:''));});
+    v.bar.setAttribute('width',190*L.file.length/maxLen);
+    pNL[k].setAttribute('class',L.up?'stream-l':'link');pNL[k].style.stroke=L.up?PC(k):'';
+    pLN[k].setAttribute('class',L.up?'http-l':'link');pLN[k].style.stroke=L.up?PC(k):'';
+  });
+  const subsOf=k=>S.reps.filter(r=>r.sub&&r.parts.includes(k)).map(r=>'R'+r.id);
+  const nl=[...[0,1,2].map(k=>[`rep02-in-p${k} → `+(S.L[k].up?'líder '+k:'—'),!S.L[k].up]),
+            ['',false],...[0,1,2].map(k=>{const s=subsOf(k);return [`rep02-p${k}    → `+(s.length?s.join(' '):'—'),!s.length];}),
+            ['',false],['mensagens tratadas: '+S.msgs,false]];
+  nl.forEach(([s,off],j)=>{Nlines[j].textContent=s;Nlines[j].setAttribute('class','nline'+(off?' off':''));});
+  S.reps.forEach((r,i)=>{
+    const v=RV[i];
+    v.g.setAttribute('class','fade'+(r.sub?'':' down'));
+    v.hdr.setAttribute('class',r.sub?'hdr-r':'hdr-off');
+    const busy=r.parts.filter(k=>r.ps[k].busy);
+    const unread=r.parts.reduce((a,k)=>a+r.ps[k].q,0);
+    v.stat.textContent=(!r.sub?r.stat:busy.length?`p${busy.join(', p')}: a recuperar por TCP`:`2 threads em subscribe()`)+(r.sub&&unread?` · por ler: ${unread}`:'');
+    v.stat.setAttribute('class','status'+(!r.sub?' bad':busy.length?' busy':''));
+    pNR[i].setAttribute('class',r.sub?'stream':'link');
+    v.cols.forEach(cv=>{
+      const p=r.ps[cv.k],L=S.L[cv.k];
+      cv.st.textContent=`último ${p.last}`;
+      cv.tcp.textContent=p.conns?`TCP×${p.conns}`:'';
+      cv.held.textContent=`retidos ${p.held.size}`;
+      cv.held.setAttribute('class','sub'+(p.held.size>LIMITE?' tcpc':''));
+      const ff=p.file.slice(-4);
+      cv.lines.forEach((e,j)=>{const x=ff[j];e.textContent=x?tiny(x.s):'';e.setAttribute('class','mono'+(x&&t-x.t<1600?(x.tcp?' fresh-t':' fresh'+cv.k):''));});
+      if(S.diff){
+        const same=p.file.length===L.file.length&&p.file.every((x,j)=>x.s===L.file[j].s);
+        const missing=L.file.length-p.file.length;
+        cv.mark.textContent=same?'= líder':(missing>0?'−'+missing:'≠');cv.mark.setAttribute('class',same?'mark-ok':'mark-bad');
+      }else cv.mark.textContent='';
+    });
+  });
+}
+function loop(){try{render();}catch(e){console.error(e);}requestAnimationFrame(loop);}
+
+/* ---------- consolas e inspetor ---------- */
+const logEl=document.getElementById('log');
+const TAG={P:['PROD','t-P'],L0:['LÍDER 0','t-L'],L1:['LÍDER 1','t-L'],L2:['LÍDER 2','t-L'],R1:['R1','t-R'],R2:['R2','t-R'],R3:['R3','t-R'],N:['NÓ','t-N']};
+function log(who,msg,kind){
+  const li=document.createElement('li');if(kind)li.className=kind;
+  const b=document.createElement('b');b.className=TAG[who][1];b.textContent=TAG[who][0];
+  const s=document.createElement('span');s.textContent=msg;li.append(b,s);logEl.append(li);
+  while(logEl.children.length>500)logEl.firstChild.remove();
+  logEl.scrollTop=logEl.scrollHeight;
+}
+const insMsg=document.getElementById('insMsg'),insTcp=document.getElementById('insTcp'),insRule=document.getElementById('insRule');
+const setMsg=s=>insMsg.textContent=s, setReg=s=>insTcp.textContent=s, setRule=s=>insRule.textContent=s;
+
+/* ---------- motor de tempo ---------- */
+let runId=0,playing=true,stepping=false,speed=1,stepWaiter=null,stepNo=0;
+class Cancel extends Error{}
+const frame=()=>new Promise(r=>requestAnimationFrame(r));
+const running=()=>playing||stepping;
+function guard(id){if(id!==runId)throw new Cancel();}
+async function sleep(ms,id){let t=0,last=now();while(t<ms){await frame();guard(id);const n=now();if(running())t+=(n-last)*speed;last=n;}}
+async function beat(title,text,code,id){
+  guard(id);stepNo++;
+  document.getElementById('stepno').textContent=stepNo;
+  document.getElementById('ctitle').textContent=title;
+  document.getElementById('ctext').textContent=text;
+  document.getElementById('ccode').textContent=code||'';
+  if(playing&&!stepping){await sleep(Math.max(1900,text.length*32),id);}
+  else{stepping=false;await new Promise(r=>stepWaiter=r);stepWaiter=null;guard(id);stepping=!playing;}
+}
+async function fly(path,label,id,{dur=800,kind='pk',reverse=false,color=null}={}){
+  const g=el('g',{class:kind},pkLayer);
+  let shape;
+  if(kind==='pk')shape=el('circle',{r:12},g);
+  else{const w=Math.max(30,label.length*6.6+14);shape=el('rect',{x:-w/2,y:-10,width:w,height:20,rx:10},g);}
+  if(color){if(kind==='tcpr')shape.style.stroke=color;else shape.style.fill=color;}
+  const tt=tx(0,4,'',label,g);if(color&&kind==='tcpr')tt.style.fill=color;
+  const L=path.getTotalLength();let p=0,last=now();
+  try{while(p<1){await frame();guard(id);const n=now();if(running())p+=(n-last)*speed/dur;last=n;
+      const f=Math.min(p,1);const pt=path.getPointAtLength((reverse?1-f:f)*L);g.setAttribute('transform',`translate(${pt.x},${pt.y})`);}}
+  finally{g.remove();}
+}
+async function dropAt(x,y,id){const g=el('g',{class:'drop',transform:`translate(${x},${y})`},pkLayer);tx(0,5,'','✕',g);try{await sleep(500,id);}finally{g.remove();}}
+const pend=new Set();
+function track(p){const q=p.catch(e=>{if(!(e instanceof Cancel))console.error(e);});pend.add(q);q.then(()=>pend.delete(q));return p;}
+const allPs=()=>S.reps.flatMap(r=>r.parts.map(k=>r.ps[k]));
+async function settle(id){
+  for(;;){await Promise.all([...pend,...allPs().map(p=>p.chain)]);guard(id);await frame();guard(id);
+    if(!pend.size&&allPs().every(p=>!p.q&&!p.busy))return;}
+}
+
+/* ---------- registos ---------- */
+const T0=Date.UTC(2026,9,1,10,15,0);
+let tick=0;
+function mkLine(seq,s,t){tick++;return `${seq};${s};${t.toFixed(1)};${new Date(T0+tick*1000).toISOString().slice(0,19)}`;}
+function mulberry(seed){let a=seed;return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+let rnd=mulberry(7);
+function append(file,s,tcp){file.push({s,t:now(),tcp:!!tcp});}
+
+/* ---------- réplica: uma thread de subscrição por partição ---------- */
+function arrive(r,k,rec,id){
+  const p=r.ps[k];p.q++;
+  p.chain=p.chain.then(async()=>{p.q--;guard(id);if(!r.sub)return;await onReg(r,k,rec,id);})
+    .catch(e=>{if(!(e instanceof Cancel))console.error(e);});
+}
+function drain(p,who,k,quiet){
+  while(p.held.has(p.last+1)){const x=p.held.get(p.last+1);p.held.delete(p.last+1);append(p.file,x);p.last++;if(!quiet)log(who,`p${k} aplicado (estava retido): `+x);}
+}
+async function onReg(r,k,rec,id){
+  const who='R'+r.id,p=r.ps[k],seq=rec.seq,q=S.quiet;
+  p.addr=rec.addr+':'+rec.port;
+  if(seq<=p.last||p.held.has(seq))log(who,`p${k} DUPLICADO: ${seq}`,'warn');
+  else if(seq===p.last+1){append(p.file,rec.line);p.last=seq;if(!q)log(who,`p${k} aplicado: `+rec.line);drain(p,who,k,q);}
+  else{p.held.set(seq,rec.line);if(!q||p.held.size===1)log(who,`p${k} EM ESPERA: ${seq} (falta o registo ${p.last+1})`,'warn');}
+  if(p.held.size>LIMITE)await recover(r,k,id);
+}
+async function recover(r,k,id){
+  const i=r.id-1,who='R'+r.id,p=r.ps[k],L=S.L[k];
+  const from=p.last+1,to=Math.min(...p.held.keys())-1;
+  p.busy=true;p.conns++;
+  const path=tcpPath(i,k);
+  log(who,`p${k} RECUPERAÇÃO: ${from}..${to} pedida a ${p.addr}`,'tcp');
+  setRule(`R${r.id} · partição ${k}\nretidos = ${p.held.size} > ${LIMITE}\n→ PEDIDO ${from} ${to} a ${p.addr}\n\nas outras partições de R${r.id}\ncontinuam a ser lidas`);
+  try{
+    await fly(path,`PEDIDO ${from} ${to}`,id,{kind:'tcpq',dur:1000,color:PC(k)});
+    while(L.busy)await sleep(60,id);
+    L.busy=true;
+    const top=Math.min(to,L.seq);
+    const recs=L.file.filter(x=>{const s=seqOf(x.s);return s>=from&&s<=top;});
+    log('L'+k,`RECUPERAÇÃO: ${from}..${top} para 127.0.0.1:${52000+r.id*37+p.conns} (${recs.length} registos)`,'tcp');
+    await fly(path,recs.length+(recs.length===1?' registo':' registos'),id,{kind:'tcpr',dur:1000,reverse:true,color:PC(k)});
+    recs.forEach(x=>{const s=seqOf(x.s);if(s===p.last+1){append(p.file,x.s,true);p.last=s;p.recovered++;if(!S.quiet)log(who,`p${k} RECUPERADO: ${s}`,'tcp');}});
+    if(S.quiet&&recs.length)log(who,`p${k} RECUPERADO: ${seqOf(recs[0].s)} … ${seqOf(recs[recs.length-1].s)}`,'tcp');
+    await fly(path,'FIM',id,{kind:'tcpr',dur:500,reverse:true,color:PC(k)});
+    L.busy=false;
+    drain(p,who,k,S.quiet);
+  }finally{path.remove();p.busy=false;}
+}
+
+/* ---------- produtor → líder k → réplicas da partição k ---------- */
+async function typeCLI(s,id,ms=50){S.P.status='a ler da CLI';for(const c of s){S.P.cli+=c;await sleep(ms,id);}await sleep(220,id);}
+async function produce(s,t,id,opt={}){
+  const dur=opt.dur||1,P=S.P,quiet=opt.quiet,k=partOf(s);
+  if(!opt.noType)await typeCLI(`${s} ${t.toFixed(1)}`,id,opt.fastType?18:50);
+  const msg=`IN;${s};${t.toFixed(1)}`;
+  P.count[k]++;P.status=`→ p${k}`;
+  if(!quiet)log('P',`→ p${k}  ${msg}`);
+  setMsg(`"${s}".hashCode() = ${jhash(s)}\nMath.floorMod(${jhash(s)}, ${N}) = ${k}\n\n→ tópico rep02-in-p${k}\n  ${msg}`);
+  if(opt.beats)await beat(`${s} pertence à partição ${k}`,`O produtor aplica a função de partição ao identificador do sensor e publica a leitura no tópico de entrada da partição ${k}. Não sabe quem é o líder dessa partição.`,`Math.floorMod("${s}".hashCode(), ${N})   // ${k}`,id);
+  const job=(async()=>{
+    await fly(pPN,'IN p'+k,id,{kind:'pill',dur:520*dur,color:PC(k)});
+    S.msgs++;
+    const L=S.L[k];
+    if(!L.up){log('N',`rep02-in-p${k} sem subscritores: ${msg} descartada`,'warn');await dropAt(290,196+k*18,id);return;}
+    await fly(pNL[k],'IN',id,{kind:'pill',dur:460*dur,color:PC(k)});
+    const seq=++L.seq,line=mkLine(seq,s,t);
+    append(L.file,line);
+    if(!quiet)log('L'+k,'Registado e publicado: '+line);
+    const port=PORTO_BASE+k,rec={seq,line,addr:ADDR,port},reg=`REG;${ADDR};${port};${line}`;
+    const holders=S.reps.filter(r=>r.parts.includes(k)).map(r=>'R'+r.id);
+    if(!quiet){setReg(`tópico rep02-p${k}\n\n${reg}\n\nseq ${seq} da partição ${k}: cada\nlíder tem a sua própria sequência`);
+      setRule(`partição ${k} guardada por\n${holders.join(' e ')}  (R = 2)\n\nrecuperação, se for precisa:\nTCP a ${ADDR}:${port}`);}
+    if(opt.beats)await beat(`O líder ${k} numera dentro da partição`,`Atribui o seq ${seq} da partição ${k}, escreve em lider-p${k}.txt e publica REG em rep02-p${k}. Só as réplicas que guardam a partição ${k} subscreveram este tópico.`,reg,id);
+    await fly(pLN[k],'REG '+seq,id,{kind:'reg',dur:460*dur,color:PC(k)});
+    S.msgs++;
+    await Promise.all(S.reps.map((r,i)=>(r.sub&&r.parts.includes(k))?fly(pNR[i],String(seq),id,{dur:(700+i*60)*dur,color:PC(k)}).then(()=>{if(r.sub)arrive(r,k,rec,id);}):null).filter(Boolean));
+  })();
+  track(job);
+  if(opt.noWait)await sleep(opt.gap||150,id);else await job;
+  P.cli='';P.status='hasNextLine() à espera';
+}
+async function rajada(n,s,id,{hot=false,gap=170,at={}}={}){
+  const cmd=hot?'rajada-quente':'rajada';
+  await typeCLI(`${cmd} ${n} ${s}`,id);
+  const before=[...S.P.count];
+  const t0=1790843700000+Math.floor(rnd()*1000);
+  log('P',`${cmd} ${n} ${s}: primeira publicação em ${t0}`);
+  for(let j=0;j<n;j++){
+    if(at[j])await at[j]();
+    let sensor;
+    if(hot&&rnd()<.8)sensor='S01';
+    else{const lo=hot?2:1;sensor='S'+String(lo+Math.floor(rnd()*(s-lo+1))).padStart(2,'0');}
+    const temp=15+Math.round(rnd()*150)/10;
+    await produce(sensor,temp,id,{noType:true,noWait:true,quiet:true,dur:.55,gap});
+  }
+  log('P',`${cmd} ${n} ${s}: última publicação em ${t0+n*2}`);
+  log('P',`${cmd}: `+[0,1,2].map(k=>`p${k} ${S.P.count[k]-before[k]}`).join(' · '));
+  S.P.cli='';
+}
+
+/* ---------- arranque dos processos ---------- */
+async function subRep(r,id,quiet){
+  const i=r.id-1;
+  await fly(pNR[i],'sub ×2',id,{kind:'sreq',dur:600,reverse:true});
+  r.sub=true;
+  if(!quiet)log('R'+r.id,`Réplica ${r.id} subscreve `+r.parts.map(k=>`rep02-p${k} (lastSeq() = ${r.ps[k].last})`).join(' e '));
+}
+async function subLeader(k,id,quiet){
+  await fly(pNL[k],'sub',id,{kind:'sreq',dur:480,reverse:true});
+  const L=S.L[k];L.up=true;L.status='subscribe() bloqueado';
+  if(!quiet)log('L'+k,`Líder p${k}: lastSeq() = ${L.seq}, subscreve rep02-in-p${k}, à escuta em ${ADDR}:${PORTO_BASE+k}`);
+}
+function liveAll(){
+  S.L.forEach(L=>{L.up=true;L.status='subscribe() bloqueado';});
+  S.reps.forEach(r=>r.sub=true);
+  S.P.ready=true;S.P.status='hasNextLine() à espera';
+}
+const SIX=[['S01',21.5],['S02',19.8],['S03',23.1],['S04',18.4],['S05',25.2],['S06',22.7]];
+
+/* ---------- cenários ---------- */
+const SC={
+A:async id=>{
+  log('N','Daemon is ready  (API 5001, Pubsub.Enabled = true)');
+  await beat('Três partições, R = 2','Cada réplica guarda duas partições: R1 guarda p0 e p1, R2 guarda p1 e p2, R3 guarda p2 e p0. Arrancam primeiro as réplicas, cada uma com uma thread de subscrição por partição.','java -cp out rep02.PartitionReplica 1 0,1\njava -cp out rep02.PartitionReplica 2 1,2\njava -cp out rep02.PartitionReplica 3 2,0',id);
+  for(const r of S.reps)await subRep(r,id);
+  await beat('Um líder por partição','Cada líder subscreve o seu tópico de entrada e escuta no seu porto de recuperação, 7000 + k.','java -cp out rep02.PartitionLeader 0 3\njava -cp out rep02.PartitionLeader 1 3\njava -cp out rep02.PartitionLeader 2 3',id);
+  await Promise.all([0,1,2].map(k=>subLeader(k,id)));
+  S.P.ready=true;S.P.status='hasNextLine() à espera';log('P',"Produtor pronto (N = 3). Formato: <sensor> <temperatura> | rajada <n> <s> | rajada-quente <n> <s>");
+  await produce(...SIX[0],id,{beats:true});
+  await settle(id);
+  await beat('Duas réplicas, a mesma partição','R1 e R3 receberam o registo e escreveram-no no ficheiro da partição 0. R2 não subscreveu rep02-p0 e não o recebe.','',id);
+  for(let j=1;j<6;j++)await produce(...SIX[j],id,{fastType:true});
+  await settle(id);S.diff=true;
+  await beat('Cada registo numa partição, em duas réplicas','Cada leitura foi para a partição calculada pelo produtor. Cada partição tem a sua própria sequência a começar em 1, e cada ficheiro de réplica é igual ao do líder da sua partição.','java -cp out rep02.PartitionCheck 3 resultados/',id);
+},
+B:async id=>{
+  rnd=mulberry(42);
+  liveAll();log('N','Daemon is ready  (API 5001)');
+  await beat('rajada 60 20','Leituras de S01 a S20, escolhidos ao acaso. A ficha usa 3000; aqui são 60 para caberem no ecrã. Os três líderes registam em paralelo, cada um na sua partição.','rajada 60 20',id);
+  S.quiet=true;await rajada(60,20,id);await settle(id);S.quiet=false;S.diff=true;
+  const c=S.L.map(L=>L.file.length);
+  await beat('Registos por partição',`p0 ${c[0]} · p1 ${c[1]} · p2 ${c[2]}. Cada réplica guarda duas das três partições. As barras por baixo dos líderes mostram o número de registos de cada partição.`,'java -cp out rep02.PartitionCheck 3 resultados/',id);
+},
+C:async id=>{
+  rnd=mulberry(42);
+  liveAll();log('N','Daemon is ready  (API 5001)');
+  await beat('rajada-quente 60 20','Igual à rajada, mas 80 % das leituras vêm de S01. Todas as leituras de um sensor vão para a mesma partição.',`rajada-quente 60 20\n"S01" → floorMod(${jhash('S01')}, 3) = ${partOf('S01')}`,id);
+  S.quiet=true;await rajada(60,20,id,{hot:true});await settle(id);S.quiet=false;S.diff=true;
+  const c=S.L.map(L=>L.file.length),avg=(c[0]+c[1]+c[2])/3;
+  await beat('Uma partição com quase toda a carga',`p0 ${c[0]} · p1 ${c[1]} · p2 ${c[2]}. Desequilíbrio (máximo / média) = ${(Math.max(...c)/avg).toFixed(2).replace('.',',')}. O líder 0 e as réplicas da partição 0 fazem a maior parte do trabalho.`,'',id);
+},
+D:async id=>{
+  rnd=mulberry(42);
+  liveAll();log('N','Daemon is ready  (API 5001)');
+  const L1=S.L[1];let sentDown=0,c0;
+  await beat('rajada 60 20 com uma falha','A meio da rajada pára-se o líder da partição 1, e mais tarde volta a arrancar.','rajada 60 20',id);
+  S.quiet=true;
+  await rajada(60,20,id,{at:{
+    18:async()=>{L1.up=false;L1.status='parado';log('L1','^C  (processo terminado)','warn');c0=S.P.count[1];
+      await beat('O líder 1 pára','O nó deixa de ter subscritores em rep02-in-p1. O produtor continua a publicar nesse tópico.','',id);},
+    40:async()=>{sentDown=S.P.count[1]-c0;
+      await beat('O líder 1 volta a arrancar',`Lê lastSeq() de lider-p1.txt (${L1.seq}) e continua a numerar a partir daí.`,'java -cp out rep02.PartitionLeader 1 3',id);
+      await subLeader(1,id);}
+  }});
+  await settle(id);S.quiet=false;S.diff=true;
+  log('P',`enviadas para p1: ${S.P.count[1]} · lider-p1.txt: ${L1.file.length} registos`);
+  await beat('O que aconteceu à partição 1',`Com o líder 1 parado, ${sentDown} leituras publicadas em rep02-in-p1 não tinham subscritor. O produtor não recebeu nenhum erro, as partições 0 e 2 não foram afetadas, e a sequência de p1 não tem saltos: nenhum número foi atribuído a essas leituras.`,'',id);
+},
+E:async id=>{
+  rnd=mulberry(42);
+  liveAll();log('N','Daemon is ready  (API 5001)');
+  const r1=S.reps[0];
+  await beat('rajada 90 20 com uma réplica parada','A meio da rajada pára-se a réplica 1, que guarda p0 e p1, e mais tarde volta a arrancar.','rajada 90 20',id);
+  S.quiet=true;
+  await rajada(90,20,id,{gap:180,at:{
+    12:async()=>{r1.sub=false;r1.stat='parada (processo terminado)';r1.parts.forEach(k=>{r1.ps[k].held.clear();r1.ps[k].addr=null;});log('R1','^C  (processo terminado)','warn');
+      await beat('R1 pára','As partições 0 e 1 continuam disponíveis: R3 tem p0 e R2 tem p1.','',id);},
+    42:async()=>{await beat('R1 volta a arrancar','Lê lastSeq() de cada um dos seus ficheiros. Cada partição tem o seu estado: retidos, último seq e endereço do líder.','java -cp out rep02.PartitionReplica 1 0,1',id);
+      await subRep(r1,id);}
+  }});
+  await settle(id);S.quiet=false;S.diff=true;
+  S.reps.forEach(r=>log('R'+r.id,r.parts.map(k=>`p${k}: ligações ${r.ps[k].conns}, obtidos por TCP ${r.ps[k].recovered}, retidos ${r.ps[k].held.size}`).join(' · '),r.parts.some(k=>r.ps[k].held.size)?'warn':''));
+  const rec=r1.parts.filter(k=>r1.ps[k].conns).map(k=>`p${k} a ${ADDR}:${PORTO_BASE+k}`);
+  await beat('Recuperação por partição',(rec.length?`R1 recuperou cada partição de forma independente, junto do líder dessa partição: ${rec.join(' e ')}. `:'R1 não chegou a ter mais de dez retidos em nenhuma partição. ')+'As marcas junto a cada ficheiro mostram que réplicas convergiram.','java -cp out rep02.PartitionCheck 3 resultados/',id);
+}
+};
+
+/* ---------- controlo ---------- */
+let current='A';
+async function run(sc){
+  runId++;const id=runId;stepNo=0;stepping=false;tick=0;rnd=mulberry(7);
+  if(stepWaiter){const w=stepWaiter;stepWaiter=null;w();}
+  while(pkLayer.firstChild)pkLayer.firstChild.remove();
+  while(tcpLayer.firstChild)tcpLayer.firstChild.remove();
+  pend.clear();
+  logEl.textContent='';setMsg('—');setReg('—');setRule('—');
+  S=freshState();
+  try{await SC[sc](id);
+    if(id===runId){await sleep(200,id);document.getElementById('ctitle').textContent+=' · fim do cenário';}
+  }catch(e){if(!(e instanceof Cancel))console.error(e);}
+}
+const playBtn=document.getElementById('play');
+function syncPlay(){playBtn.textContent=playing?'❚❚ Pausa':'▶ Reproduzir';}
+playBtn.onclick=()=>{playing=!playing;stepping=false;if(playing&&stepWaiter)stepWaiter();syncPlay();};
+document.getElementById('step').onclick=()=>{if(playing){playing=false;syncPlay();}if(stepWaiter)stepWaiter();else stepping=true;};
+document.getElementById('restart').onclick=()=>run(current);
+document.getElementById('speed').onchange=e=>speed=parseFloat(e.target.value);
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+  current=b.dataset.sc;document.querySelectorAll('.tab').forEach(x=>x.setAttribute('aria-pressed',x===b));run(current);});
+try{if(matchMedia('(prefers-reduced-motion: reduce)').matches)playing=false;}catch(e){}
+syncPlay();
+S=freshState();
+requestAnimationFrame(loop);
+run('A');
+})();
+</script>
+</body>
+</html>
+
+
