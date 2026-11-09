@@ -1,0 +1,9 @@
+ARRANQUE;p0;no=n1;seq=0;ultimoTermo=0;termo=0;porto=7000
+Nó pronto: papel=SEGUIDOR termo=0 seq=0 | TCP em 127.0.0.1:7000
+CANDIDATO;p0;termo=1
+VOTO;p0;termo=1;candidato=n2;recusado
+CANDIDATO;p0;termo=2
+VOTO;p0;termo=2;candidato=n3;recusado
+NOVO_LIDER;p0;termo=2;lider=n3
+RECEBIDO;p0;termo=2;lider=n3;hb=1;ultimoSeq=0;n=0;seq=-
+RECEBIDO;p0;termo=2;lider=n3;hb=2;ultimoSeq=0;n=0;seq=-

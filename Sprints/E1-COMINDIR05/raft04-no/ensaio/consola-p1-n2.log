@@ -1,0 +1,5 @@
+ARRANQUE;p1;no=n2;seq=0;ultimoTermo=0;termo=0;porto=7004
+Nó pronto: papel=SEGUIDOR termo=0 seq=0 | TCP em 127.0.0.1:7004
+CANDIDATO;p1;termo=1
+LIDER;p1;termo=1;votos=[1, 2]
+Passei a líder: termo=1 seq=0 L=0 V=0,0,0

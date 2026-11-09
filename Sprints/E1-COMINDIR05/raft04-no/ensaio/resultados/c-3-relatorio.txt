@@ -1,0 +1,714 @@
+=== RAFT CHECK ===
+Partições: 3 | pasta: C:\Users\renat\Desktop\escola\SDT\StD-2026-2027_Extra2\Sprints\E1-COMINDIR05\raft04-no\ensaio\.
+
+################ p0 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n3(3 votos) → líder n3 | eleição 61 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 8675 ms (8,7 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=400 n2=400 n3=400 | comparados até seq 400 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p1 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n3(3 votos) → líder n3 | eleição 53 ms
+termo 2: candidatos n1(1 voto) n2(1 voto) → VOTO DIVIDIDO, sem líder
+termo 3: candidatos n2(2 votos) → líder n2 | eleição 12 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 7257 ms (7,3 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+falha p1;n3 (líder do termo 1) @1794164723775: indisponibilidade 12265 ms (12,3 s), novo líder n2 termo 3 | leituras enviadas nesse intervalo: 150
+-- Registos truncados --
+n3 @1794164764080: TRUNCADO de=1;descartados=15;termos=1 | destes, existem com outro seq no registo final do líder n2: 3 de 15
+(líder do último termo: n2)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=108 n2=108 n3=108 | comparados até seq 108 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p2 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(3 votos) → líder n1 | eleição 56 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 7662 ms (7,7 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n1)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=290 n2=290 n3=290 | comparados até seq 290 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ Leituras perdidas ################
+p0: enviadas 366, perdidas 0
+p1: enviadas 258, perdidas 165
+   perdida: 1794164723505;p1;S05;23.3
+   perdida: 1794164723537;p1;S05;28.7
+   perdida: 1794164723564;p1;S05;26.0
+   perdida: 1794164723577;p1;S02;25.3
+   perdida: 1794164723597;p1;S08;18.1
+   perdida: 1794164723617;p1;S02;28.2
+   perdida: 1794164723632;p1;S05;21.4
+   perdida: 1794164723643;p1;S05;22.0
+   perdida: 1794164723690;p1;S08;15.1
+   perdida: 1794164723695;p1;S08;24.8
+   perdida: 1794164723724;p1;S05;18.7
+   perdida: 1794164723763;p1;S02;28.5
+   perdida: 1794164723801;p1;S08;28.5
+   perdida: 1794164723806;p1;S02;23.8
+   perdida: 1794164723816;p1;S08;20.1
+   perdida: 1794164723842;p1;S08;17.6
+   perdida: 1794164723859;p1;S08;16.7
+   perdida: 1794164723870;p1;S05;17.1
+   perdida: 1794164723891;p1;S02;24.4
+   perdida: 1794164723894;p1;S02;22.6
+   perdida: 1794164723914;p1;S08;21.7
+   perdida: 1794164723929;p1;S05;21.0
+   perdida: 1794164723943;p1;S08;18.3
+   perdida: 1794164723950;p1;S02;22.3
+   perdida: 1794164723958;p1;S05;25.9
+   perdida: 1794164723961;p1;S08;26.6
+   perdida: 1794164723989;p1;S05;27.1
+   perdida: 1794164724016;p1;S05;22.0
+   perdida: 1794164724020;p1;S05;17.4
+   perdida: 1794164724037;p1;S05;25.8
+   perdida: 1794164724059;p1;S08;16.9
+   perdida: 1794164724103;p1;S08;22.2
+   perdida: 1794164724127;p1;S05;22.6
+   perdida: 1794164724160;p1;S02;16.9
+   perdida: 1794164724167;p1;S05;16.0
+   perdida: 1794164724210;p1;S05;21.9
+   perdida: 1794164724220;p1;S02;25.7
+   perdida: 1794164724225;p1;S02;29.8
+   perdida: 1794164724242;p1;S05;20.2
+   perdida: 1794164724247;p1;S08;22.7
+   perdida: 1794164724255;p1;S05;22.6
+   perdida: 1794164724287;p1;S08;18.0
+   perdida: 1794164724290;p1;S08;23.8
+   perdida: 1794164724302;p1;S05;16.2
+   perdida: 1794164724313;p1;S05;21.9
+   perdida: 1794164724324;p1;S05;18.8
+   perdida: 1794164724334;p1;S02;22.4
+   perdida: 1794164724340;p1;S08;23.9
+   perdida: 1794164724381;p1;S08;18.6
+   perdida: 1794164724385;p1;S02;18.7
+   perdida: 1794164724388;p1;S02;19.3
+   perdida: 1794164724431;p1;S05;21.0
+   perdida: 1794164724453;p1;S05;22.1
+   perdida: 1794164724507;p1;S08;25.2
+   perdida: 1794164724587;p1;S05;17.7
+   perdida: 1794164724605;p1;S08;26.2
+   perdida: 1794164724637;p1;S02;26.2
+   perdida: 1794164724654;p1;S02;15.1
+   perdida: 1794164724675;p1;S05;19.1
+   perdida: 1794164724678;p1;S08;19.3
+   perdida: 1794164724692;p1;S08;22.7
+   perdida: 1794164724695;p1;S02;21.4
+   perdida: 1794164724716;p1;S02;16.1
+   perdida: 1794164724723;p1;S08;17.9
+   perdida: 1794164724731;p1;S08;24.2
+   perdida: 1794164724738;p1;S08;15.8
+   perdida: 1794164724746;p1;S08;22.7
+   perdida: 1794164724749;p1;S02;25.7
+   perdida: 1794164724765;p1;S08;26.8
+   perdida: 1794164724796;p1;S05;16.3
+   perdida: 1794164724819;p1;S08;24.1
+   perdida: 1794164724826;p1;S02;26.0
+   perdida: 1794164724829;p1;S05;28.7
+   perdida: 1794164726831;p1;S02;27.7
+   perdida: 1794164726838;p1;S05;26.1
+   perdida: 1794164726841;p1;S02;20.6
+   perdida: 1794164726856;p1;S02;19.2
+   perdida: 1794164726873;p1;S08;25.7
+   perdida: 1794164726937;p1;S05;19.8
+   perdida: 1794164726956;p1;S08;29.1
+   perdida: 1794164726965;p1;S05;20.8
+   perdida: 1794164726998;p1;S02;24.1
+   perdida: 1794164727011;p1;S08;15.2
+   perdida: 1794164727021;p1;S08;28.8
+   perdida: 1794164727024;p1;S02;18.7
+   perdida: 1794164727044;p1;S05;19.1
+   perdida: 1794164727047;p1;S08;25.7
+   perdida: 1794164727083;p1;S08;24.5
+   perdida: 1794164727116;p1;S08;19.4
+   perdida: 1794164727123;p1;S08;20.8
+   perdida: 1794164727159;p1;S05;23.8
+   perdida: 1794164727161;p1;S08;21.7
+   perdida: 1794164727164;p1;S08;23.7
+   perdida: 1794164727167;p1;S08;29.4
+   perdida: 1794164727178;p1;S02;17.1
+   perdida: 1794164727195;p1;S02;15.5
+   perdida: 1794164727201;p1;S08;28.5
+   perdida: 1794164727204;p1;S08;22.3
+   perdida: 1794164727216;p1;S05;20.3
+   perdida: 1794164727241;p1;S02;27.5
+   perdida: 1794164727251;p1;S08;25.3
+   perdida: 1794164727257;p1;S02;17.6
+   perdida: 1794164727280;p1;S08;23.8
+   perdida: 1794164727290;p1;S05;25.4
+   perdida: 1794164727303;p1;S05;26.4
+   perdida: 1794164727317;p1;S02;24.3
+   perdida: 1794164727320;p1;S08;18.0
+   perdida: 1794164727326;p1;S05;23.3
+   perdida: 1794164727339;p1;S05;22.4
+   perdida: 1794164727351;p1;S05;25.7
+   perdida: 1794164727354;p1;S08;27.1
+   perdida: 1794164727357;p1;S08;24.5
+   perdida: 1794164727360;p1;S02;29.8
+   perdida: 1794164727368;p1;S05;26.5
+   perdida: 1794164727395;p1;S08;18.3
+   perdida: 1794164727426;p1;S05;19.4
+   perdida: 1794164727463;p1;S08;16.3
+   perdida: 1794164727509;p1;S05;17.9
+   perdida: 1794164727526;p1;S02;29.9
+   perdida: 1794164727535;p1;S08;29.2
+   perdida: 1794164727581;p1;S02;27.7
+   perdida: 1794164727599;p1;S02;22.8
+   perdida: 1794164727607;p1;S08;19.2
+   perdida: 1794164727629;p1;S02;19.4
+   perdida: 1794164727632;p1;S05;23.2
+   perdida: 1794164727724;p1;S05;18.4
+   perdida: 1794164727733;p1;S02;24.1
+   perdida: 1794164727748;p1;S05;23.2
+   perdida: 1794164727758;p1;S08;20.6
+   perdida: 1794164727765;p1;S02;18.0
+   perdida: 1794164727773;p1;S02;25.8
+   perdida: 1794164727781;p1;S08;16.6
+   perdida: 1794164727784;p1;S05;25.5
+   perdida: 1794164727799;p1;S08;22.2
+   perdida: 1794164727802;p1;S05;28.1
+   perdida: 1794164727805;p1;S05;18.6
+   perdida: 1794164727823;p1;S05;21.1
+   perdida: 1794164727826;p1;S05;29.8
+   perdida: 1794164727846;p1;S02;22.9
+   perdida: 1794164727885;p1;S02;27.0
+   perdida: 1794164727924;p1;S02;28.6
+   perdida: 1794164738189;p1;S08;26.1
+   perdida: 1794164738203;p1;S02;20.3
+   perdida: 1794164738237;p1;S05;16.5
+   perdida: 1794164738246;p1;S05;29.7
+   perdida: 1794164738292;p1;S02;27.5
+   perdida: 1794164738343;p1;S05;17.2
+   perdida: 1794164738394;p1;S08;20.4
+   perdida: 1794164738397;p1;S02;18.4
+   perdida: 1794164738457;p1;S05;17.5
+   perdida: 1794164738462;p1;S05;17.7
+   perdida: 1794164738484;p1;S08;20.0
+   perdida: 1794164738556;p1;S05;23.9
+   perdida: 1794164738563;p1;S02;18.2
+   perdida: 1794164738576;p1;S08;19.6
+   perdida: 1794164738647;p1;S05;29.7
+   perdida: 1794164738854;p1;S02;16.4
+   perdida: 1794164738894;p1;S05;18.3
+   perdida: 1794164738896;p1;S05;28.5
+   perdida: 1794164738920;p1;S02;23.4
+   perdida: 1794164738929;p1;S02;27.2
+   perdida: 1794164739037;p1;S08;22.3
+   perdida: 1794164739044;p1;S08;25.8
+   perdida: 1794164739049;p1;S02;28.3
+   perdida: 1794164739080;p1;S08;26.4
+p2: enviadas 276, perdidas 0
+Total de leituras perdidas: 165
+
+################ Monitores ################
+monitor-processador.txt: {NOVO_LIDER=4, RECEBIDO=97, RETOMA=4, SUSPEITA=4}
+monitor-produtor.txt: {NOVO_LIDER=4, RETOMA=4, SUSPEITA=4}
+
+=== RESUMO ===
+Termos com mais de um LIDER (tem de ser 0): 0
+Registos descartados (TRUNCADO): 15
+seq divergentes na coincidência final: 0
+=== FIM ===
+=== RAFT CHECK ===
+Partições: 3 | pasta: C:\Users\renat\Desktop\escola\SDT\StD-2026-2027_Extra2\Sprints\E1-COMINDIR05\raft04-no\ensaio\.
+
+################ p0 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n3(3 votos) → líder n3 | eleição 42 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 8397 ms (8,4 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=394 n2=394 n3=394 | comparados até seq 394 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p1 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n2(3 votos) → líder n2 | eleição 44 ms
+termo 2: candidatos n3(2 votos) → líder n3 | eleição 16 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 7170 ms (7,2 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+falha p1;n2 (líder do termo 1) @1794164800544: indisponibilidade 7506 ms (7,5 s), novo líder n3 termo 2 | leituras enviadas nesse intervalo: 158
+-- Registos truncados --
+n2 @1794164836089: TRUNCADO de=1;descartados=17;termos=1 | destes, existem com outro seq no registo final do líder n3: 2 de 17
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=98 n2=98 n3=98 | comparados até seq 98 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p2 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n3(3 votos) → líder n3 | eleição 43 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6794 ms (6,8 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=303 n2=303 n3=303 | comparados até seq 303 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ Leituras perdidas ################
+p0: enviadas 351, perdidas 0
+p1: enviadas 258, perdidas 175
+   perdida: 1794164800261;p1;S08;29.4
+   perdida: 1794164800273;p1;S08;27.2
+   perdida: 1794164800332;p1;S08;22.9
+   perdida: 1794164800343;p1;S08;23.7
+   perdida: 1794164800362;p1;S02;20.4
+   perdida: 1794164800371;p1;S02;21.3
+   perdida: 1794164800375;p1;S05;28.7
+   perdida: 1794164800393;p1;S08;18.3
+   perdida: 1794164800396;p1;S08;29.3
+   perdida: 1794164800418;p1;S05;26.7
+   perdida: 1794164800423;p1;S08;16.3
+   perdida: 1794164800426;p1;S02;19.0
+   perdida: 1794164800430;p1;S05;22.5
+   perdida: 1794164800468;p1;S05;28.7
+   perdida: 1794164800482;p1;S08;19.9
+   perdida: 1794164800569;p1;S02;21.0
+   perdida: 1794164800593;p1;S05;24.5
+   perdida: 1794164800600;p1;S02;15.7
+   perdida: 1794164800612;p1;S08;20.2
+   perdida: 1794164800639;p1;S05;17.5
+   perdida: 1794164800651;p1;S02;28.9
+   perdida: 1794164800664;p1;S02;16.8
+   perdida: 1794164800716;p1;S05;15.8
+   perdida: 1794164800724;p1;S02;24.6
+   perdida: 1794164800732;p1;S08;25.2
+   perdida: 1794164800742;p1;S02;23.9
+   perdida: 1794164800746;p1;S02;28.0
+   perdida: 1794164800763;p1;S05;28.5
+   perdida: 1794164800766;p1;S05;27.0
+   perdida: 1794164800770;p1;S05;22.2
+   perdida: 1794164800785;p1;S05;27.4
+   perdida: 1794164800788;p1;S08;28.7
+   perdida: 1794164800791;p1;S05;15.2
+   perdida: 1794164800794;p1;S08;22.7
+   perdida: 1794164800797;p1;S02;25.2
+   perdida: 1794164800863;p1;S05;25.8
+   perdida: 1794164800898;p1;S08;29.8
+   perdida: 1794164800913;p1;S02;24.7
+   perdida: 1794164800932;p1;S08;20.7
+   perdida: 1794164800938;p1;S08;16.9
+   perdida: 1794164800944;p1;S05;28.4
+   perdida: 1794164800959;p1;S02;19.6
+   perdida: 1794164800977;p1;S05;27.2
+   perdida: 1794164801004;p1;S08;28.5
+   perdida: 1794164801011;p1;S02;21.3
+   perdida: 1794164801025;p1;S05;16.4
+   perdida: 1794164801033;p1;S02;29.5
+   perdida: 1794164801037;p1;S02;23.1
+   perdida: 1794164801068;p1;S02;15.9
+   perdida: 1794164801099;p1;S05;28.8
+   perdida: 1794164801119;p1;S02;23.2
+   perdida: 1794164801126;p1;S02;17.0
+   perdida: 1794164801129;p1;S05;16.5
+   perdida: 1794164801153;p1;S05;27.7
+   perdida: 1794164801169;p1;S08;29.3
+   perdida: 1794164801173;p1;S02;16.2
+   perdida: 1794164801176;p1;S05;20.8
+   perdida: 1794164801192;p1;S08;19.7
+   perdida: 1794164801198;p1;S05;23.9
+   perdida: 1794164801212;p1;S05;15.3
+   perdida: 1794164801220;p1;S08;21.3
+   perdida: 1794164801224;p1;S05;22.4
+   perdida: 1794164801233;p1;S02;28.4
+   perdida: 1794164801260;p1;S02;29.6
+   perdida: 1794164801263;p1;S05;16.9
+   perdida: 1794164801303;p1;S02;16.1
+   perdida: 1794164801309;p1;S08;29.8
+   perdida: 1794164801312;p1;S05;27.7
+   perdida: 1794164801361;p1;S08;28.1
+   perdida: 1794164801374;p1;S05;16.6
+   perdida: 1794164801415;p1;S08;22.6
+   perdida: 1794164803578;p1;S08;24.0
+   perdida: 1794164803581;p1;S05;24.0
+   perdida: 1794164803588;p1;S08;21.8
+   perdida: 1794164803594;p1;S08;26.4
+   perdida: 1794164803599;p1;S08;18.3
+   perdida: 1794164803605;p1;S02;18.0
+   perdida: 1794164803612;p1;S05;20.3
+   perdida: 1794164803637;p1;S02;21.8
+   perdida: 1794164803648;p1;S02;20.8
+   perdida: 1794164803655;p1;S02;24.8
+   perdida: 1794164803659;p1;S02;22.7
+   perdida: 1794164803680;p1;S02;19.1
+   perdida: 1794164803695;p1;S08;20.1
+   perdida: 1794164803703;p1;S08;19.0
+   perdida: 1794164803724;p1;S05;28.9
+   perdida: 1794164803739;p1;S08;28.5
+   perdida: 1794164803743;p1;S05;16.9
+   perdida: 1794164803749;p1;S05;23.7
+   perdida: 1794164803753;p1;S08;28.0
+   perdida: 1794164803765;p1;S08;23.6
+   perdida: 1794164803780;p1;S08;28.5
+   perdida: 1794164803826;p1;S08;24.2
+   perdida: 1794164803829;p1;S02;16.3
+   perdida: 1794164803848;p1;S08;17.4
+   perdida: 1794164803863;p1;S05;19.7
+   perdida: 1794164803871;p1;S02;18.7
+   perdida: 1794164803882;p1;S05;19.6
+   perdida: 1794164803885;p1;S02;22.2
+   perdida: 1794164803914;p1;S02;16.4
+   perdida: 1794164803920;p1;S05;21.8
+   perdida: 1794164803937;p1;S05;16.4
+   perdida: 1794164803947;p1;S02;27.7
+   perdida: 1794164803954;p1;S08;24.9
+   perdida: 1794164803982;p1;S02;27.0
+   perdida: 1794164804003;p1;S05;17.9
+   perdida: 1794164804006;p1;S02;15.4
+   perdida: 1794164804009;p1;S08;23.6
+   perdida: 1794164804016;p1;S08;25.5
+   perdida: 1794164804031;p1;S05;28.8
+   perdida: 1794164804034;p1;S05;15.1
+   perdida: 1794164804041;p1;S08;16.1
+   perdida: 1794164804044;p1;S02;21.4
+   perdida: 1794164804058;p1;S08;22.5
+   perdida: 1794164804078;p1;S02;23.3
+   perdida: 1794164804081;p1;S08;17.0
+   perdida: 1794164804122;p1;S08;21.4
+   perdida: 1794164804128;p1;S08;17.6
+   perdida: 1794164804134;p1;S02;29.8
+   perdida: 1794164804168;p1;S05;16.7
+   perdida: 1794164804188;p1;S02;20.3
+   perdida: 1794164804191;p1;S05;25.8
+   perdida: 1794164804194;p1;S05;15.3
+   perdida: 1794164804200;p1;S02;25.1
+   perdida: 1794164804203;p1;S05;29.9
+   perdida: 1794164804213;p1;S02;25.2
+   perdida: 1794164804219;p1;S08;21.1
+   perdida: 1794164804231;p1;S08;23.7
+   perdida: 1794164804308;p1;S08;24.9
+   perdida: 1794164804343;p1;S05;17.7
+   perdida: 1794164804385;p1;S08;25.1
+   perdida: 1794164804410;p1;S08;23.8
+   perdida: 1794164804415;p1;S02;21.0
+   perdida: 1794164804436;p1;S08;20.9
+   perdida: 1794164804439;p1;S02;17.6
+   perdida: 1794164804456;p1;S05;19.1
+   perdida: 1794164804475;p1;S08;20.0
+   perdida: 1794164804477;p1;S08;23.7
+   perdida: 1794164804492;p1;S02;21.1
+   perdida: 1794164804498;p1;S02;20.9
+   perdida: 1794164804513;p1;S08;21.2
+   perdida: 1794164804525;p1;S02;25.2
+   perdida: 1794164804554;p1;S08;28.1
+   perdida: 1794164804560;p1;S08;23.7
+   perdida: 1794164804565;p1;S08;22.3
+   perdida: 1794164804610;p1;S05;19.9
+   perdida: 1794164804625;p1;S08;28.0
+   perdida: 1794164804628;p1;S08;18.6
+   perdida: 1794164810081;p1;S02;17.6
+   perdida: 1794164810088;p1;S05;17.4
+   perdida: 1794164810112;p1;S05;16.5
+   perdida: 1794164810157;p1;S02;28.4
+   perdida: 1794164810159;p1;S05;24.3
+   perdida: 1794164810209;p1;S02;18.9
+   perdida: 1794164810301;p1;S08;17.9
+   perdida: 1794164810334;p1;S08;18.6
+   perdida: 1794164810358;p1;S08;18.0
+   perdida: 1794164810441;p1;S08;24.5
+   perdida: 1794164810466;p1;S02;16.3
+   perdida: 1794164810519;p1;S05;22.0
+   perdida: 1794164810531;p1;S02;16.1
+   perdida: 1794164810546;p1;S08;28.6
+   perdida: 1794164810562;p1;S02;19.9
+   perdida: 1794164810576;p1;S05;21.0
+   perdida: 1794164810596;p1;S02;18.1
+   perdida: 1794164810614;p1;S05;23.8
+   perdida: 1794164810688;p1;S02;18.7
+   perdida: 1794164810739;p1;S08;15.6
+   perdida: 1794164810748;p1;S08;17.1
+   perdida: 1794164810901;p1;S08;24.3
+   perdida: 1794164810909;p1;S02;20.0
+   perdida: 1794164810944;p1;S08;23.1
+   perdida: 1794164810974;p1;S02;20.0
+   perdida: 1794164811037;p1;S02;17.2
+   perdida: 1794164811040;p1;S05;17.1
+p2: enviadas 291, perdidas 0
+Total de leituras perdidas: 175
+
+################ Monitores ################
+monitor-processador.txt: {NOVO_LIDER=4, RECEBIDO=92, RETOMA=4, SUSPEITA=4}
+monitor-produtor.txt: {NOVO_LIDER=4, RETOMA=4, SUSPEITA=4}
+
+=== RESUMO ===
+Termos com mais de um LIDER (tem de ser 0): 0
+Registos descartados (TRUNCADO): 17
+seq divergentes na coincidência final: 0
+=== FIM ===
+=== RAFT CHECK ===
+Partições: 3 | pasta: C:\Users\renat\Desktop\escola\SDT\StD-2026-2027_Extra2\Sprints\E1-COMINDIR05\raft04-no\ensaio\.
+
+################ p0 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n2(3 votos) → líder n2 | eleição 40 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6241 ms (6,2 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n2)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=402 n2=402 n3=402 | comparados até seq 402 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p1 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(3 votos) → líder n1 | eleição 41 ms
+termo 2: candidatos n3(2 votos) → líder n3 | eleição 13 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6557 ms (6,6 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+falha p1;n1 (líder do termo 1) @1794164873017: indisponibilidade 6178 ms (6,2 s), novo líder n3 termo 2 | leituras enviadas nesse intervalo: 154
+-- Registos truncados --
+n1 @1794164907230: TRUNCADO de=1;descartados=18;termos=1 | destes, existem com outro seq no registo final do líder n3: 2 de 18
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=102 n2=102 n3=102 | comparados até seq 102 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ p2 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n3(3 votos) → líder n3 | eleição 40 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 9018 ms (9,0 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas nesta partição)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n3)
+-- Coincidência final dos ficheiros --
+registos por nó: n1=296 n2=296 n3=296 | comparados até seq 296 (o menor ultimoSeq)
+Os ficheiros coincidem: 0 seq divergentes.
+
+################ Leituras perdidas ################
+p0: enviadas 362, perdidas 0
+p1: enviadas 258, perdidas 172
+   perdida: 1794164872744;p1;S02;24.0
+   perdida: 1794164872776;p1;S02;22.9
+   perdida: 1794164872786;p1;S05;24.8
+   perdida: 1794164872820;p1;S08;29.7
+   perdida: 1794164872844;p1;S02;27.8
+   perdida: 1794164872856;p1;S02;20.4
+   perdida: 1794164872871;p1;S05;19.4
+   perdida: 1794164872875;p1;S05;15.1
+   perdida: 1794164872894;p1;S08;23.4
+   perdida: 1794164872901;p1;S02;27.9
+   perdida: 1794164872916;p1;S05;26.1
+   perdida: 1794164872920;p1;S05;26.8
+   perdida: 1794164872932;p1;S05;22.5
+   perdida: 1794164872952;p1;S05;29.4
+   perdida: 1794164872958;p1;S02;27.8
+   perdida: 1794164873007;p1;S02;16.5
+   perdida: 1794164873018;p1;S05;21.6
+   perdida: 1794164873042;p1;S05;24.3
+   perdida: 1794164873058;p1;S02;25.2
+   perdida: 1794164873061;p1;S08;20.7
+   perdida: 1794164873080;p1;S08;15.5
+   perdida: 1794164873101;p1;S02;16.7
+   perdida: 1794164873112;p1;S08;26.9
+   perdida: 1794164873128;p1;S02;25.8
+   perdida: 1794164873132;p1;S08;28.6
+   perdida: 1794164873155;p1;S08;23.1
+   perdida: 1794164873170;p1;S05;18.9
+   perdida: 1794164873183;p1;S08;18.6
+   perdida: 1794164873200;p1;S05;26.2
+   perdida: 1794164873223;p1;S05;22.4
+   perdida: 1794164873236;p1;S02;21.8
+   perdida: 1794164873244;p1;S05;23.3
+   perdida: 1794164873254;p1;S02;21.6
+   perdida: 1794164873261;p1;S05;25.8
+   perdida: 1794164873335;p1;S08;19.6
+   perdida: 1794164873350;p1;S08;26.8
+   perdida: 1794164873394;p1;S02;24.8
+   perdida: 1794164873400;p1;S05;15.5
+   perdida: 1794164873406;p1;S05;22.5
+   perdida: 1794164873413;p1;S02;19.9
+   perdida: 1794164873419;p1;S05;29.2
+   perdida: 1794164873432;p1;S08;17.4
+   perdida: 1794164873463;p1;S05;18.4
+   perdida: 1794164873473;p1;S02;20.6
+   perdida: 1794164873476;p1;S02;27.3
+   perdida: 1794164873490;p1;S02;17.8
+   perdida: 1794164873496;p1;S02;15.3
+   perdida: 1794164873498;p1;S08;18.2
+   perdida: 1794164873506;p1;S08;27.5
+   perdida: 1794164873536;p1;S05;27.3
+   perdida: 1794164873540;p1;S08;17.5
+   perdida: 1794164873546;p1;S08;26.1
+   perdida: 1794164873549;p1;S08;23.7
+   perdida: 1794164873552;p1;S02;15.6
+   perdida: 1794164873565;p1;S05;19.2
+   perdida: 1794164873569;p1;S05;21.8
+   perdida: 1794164873576;p1;S05;25.7
+   perdida: 1794164873594;p1;S02;23.8
+   perdida: 1794164873601;p1;S02;17.2
+   perdida: 1794164873617;p1;S05;25.7
+   perdida: 1794164873645;p1;S05;15.5
+   perdida: 1794164873649;p1;S08;24.3
+   perdida: 1794164873680;p1;S08;27.2
+   perdida: 1794164873684;p1;S08;15.8
+   perdida: 1794164873686;p1;S05;26.6
+   perdida: 1794164873706;p1;S05;26.7
+   perdida: 1794164873715;p1;S08;18.2
+   perdida: 1794164873732;p1;S05;20.2
+   perdida: 1794164873745;p1;S08;26.4
+   perdida: 1794164873748;p1;S08;26.3
+   perdida: 1794164873755;p1;S05;15.5
+   perdida: 1794164873771;p1;S08;28.9
+   perdida: 1794164873777;p1;S05;17.4
+   perdida: 1794164873780;p1;S02;27.8
+   perdida: 1794164873786;p1;S08;16.1
+   perdida: 1794164873806;p1;S05;18.0
+   perdida: 1794164873809;p1;S08;18.5
+   perdida: 1794164873813;p1;S08;19.8
+   perdida: 1794164876038;p1;S02;15.2
+   perdida: 1794164876042;p1;S02;25.8
+   perdida: 1794164876086;p1;S05;22.0
+   perdida: 1794164876094;p1;S05;28.3
+   perdida: 1794164876126;p1;S02;19.0
+   perdida: 1794164876129;p1;S02;26.8
+   perdida: 1794164876137;p1;S05;26.0
+   perdida: 1794164876164;p1;S02;21.4
+   perdida: 1794164876175;p1;S02;15.0
+   perdida: 1794164876182;p1;S05;28.4
+   perdida: 1794164876219;p1;S05;21.5
+   perdida: 1794164876230;p1;S05;23.2
+   perdida: 1794164876240;p1;S05;18.5
+   perdida: 1794164876247;p1;S08;17.7
+   perdida: 1794164876257;p1;S02;25.6
+   perdida: 1794164876274;p1;S05;16.2
+   perdida: 1794164876281;p1;S02;24.5
+   perdida: 1794164876300;p1;S08;27.6
+   perdida: 1794164876309;p1;S05;25.3
+   perdida: 1794164876329;p1;S05;20.1
+   perdida: 1794164876339;p1;S08;20.0
+   perdida: 1794164876354;p1;S05;19.5
+   perdida: 1794164876363;p1;S02;24.0
+   perdida: 1794164876393;p1;S08;25.7
+   perdida: 1794164876396;p1;S05;26.6
+   perdida: 1794164876431;p1;S05;23.7
+   perdida: 1794164876471;p1;S02;26.3
+   perdida: 1794164876505;p1;S02;26.4
+   perdida: 1794164876517;p1;S02;27.0
+   perdida: 1794164876520;p1;S02;18.2
+   perdida: 1794164876534;p1;S05;18.9
+   perdida: 1794164876553;p1;S08;16.4
+   perdida: 1794164876556;p1;S02;22.7
+   perdida: 1794164876585;p1;S05;17.7
+   perdida: 1794164876590;p1;S02;20.3
+   perdida: 1794164876616;p1;S08;24.0
+   perdida: 1794164876635;p1;S02;24.2
+   perdida: 1794164876638;p1;S08;17.5
+   perdida: 1794164876651;p1;S02;15.0
+   perdida: 1794164876659;p1;S08;19.0
+   perdida: 1794164876662;p1;S02;19.8
+   perdida: 1794164876665;p1;S08;27.2
+   perdida: 1794164876702;p1;S05;22.0
+   perdida: 1794164876721;p1;S02;17.3
+   perdida: 1794164876730;p1;S05;28.9
+   perdida: 1794164876733;p1;S08;15.9
+   perdida: 1794164876746;p1;S02;26.4
+   perdida: 1794164876761;p1;S05;21.7
+   perdida: 1794164876788;p1;S05;26.6
+   perdida: 1794164876804;p1;S02;29.5
+   perdida: 1794164876811;p1;S02;18.2
+   perdida: 1794164876824;p1;S02;28.5
+   perdida: 1794164876826;p1;S02;21.1
+   perdida: 1794164876834;p1;S05;16.0
+   perdida: 1794164876846;p1;S05;18.4
+   perdida: 1794164876856;p1;S02;29.9
+   perdida: 1794164876860;p1;S08;27.9
+   perdida: 1794164876877;p1;S05;25.0
+   perdida: 1794164876880;p1;S05;24.6
+   perdida: 1794164876916;p1;S05;15.3
+   perdida: 1794164876930;p1;S05;26.3
+   perdida: 1794164876933;p1;S08;16.2
+   perdida: 1794164876938;p1;S05;29.4
+   perdida: 1794164876949;p1;S05;29.6
+   perdida: 1794164876974;p1;S05;22.3
+   perdida: 1794164876987;p1;S05;17.6
+   perdida: 1794164877005;p1;S08;15.8
+   perdida: 1794164877009;p1;S05;15.3
+   perdida: 1794164877018;p1;S02;20.0
+   perdida: 1794164877020;p1;S05;28.3
+   perdida: 1794164877038;p1;S08;23.2
+   perdida: 1794164877044;p1;S02;20.8
+   perdida: 1794164877046;p1;S05;22.0
+   perdida: 1794164877070;p1;S08;22.0
+   perdida: 1794164881278;p1;S02;17.1
+   perdida: 1794164881318;p1;S08;25.0
+   perdida: 1794164881428;p1;S05;26.7
+   perdida: 1794164881460;p1;S05;20.2
+   perdida: 1794164881552;p1;S05;29.2
+   perdida: 1794164881578;p1;S02;27.6
+   perdida: 1794164881653;p1;S05;18.3
+   perdida: 1794164881662;p1;S05;15.7
+   perdida: 1794164881799;p1;S08;22.1
+   perdida: 1794164881893;p1;S02;27.5
+   perdida: 1794164881906;p1;S02;29.9
+   perdida: 1794164881935;p1;S08;17.9
+   perdida: 1794164881941;p1;S08;16.2
+   perdida: 1794164882000;p1;S08;26.6
+   perdida: 1794164882017;p1;S02;15.5
+   perdida: 1794164882024;p1;S02;19.3
+   perdida: 1794164882039;p1;S08;20.2
+   perdida: 1794164882053;p1;S08;20.3
+   perdida: 1794164882146;p1;S08;26.1
+   perdida: 1794164882219;p1;S08;15.2
+p2: enviadas 280, perdidas 0
+Total de leituras perdidas: 172
+
+################ Monitores ################
+monitor-processador.txt: {NOVO_LIDER=4, RECEBIDO=93, RETOMA=4, SUSPEITA=4}
+monitor-produtor.txt: {NOVO_LIDER=4, RETOMA=4, SUSPEITA=4}
+
+=== RESUMO ===
+Termos com mais de um LIDER (tem de ser 0): 0
+Registos descartados (TRUNCADO): 18
+seq divergentes na coincidência final: 0
+=== FIM ===

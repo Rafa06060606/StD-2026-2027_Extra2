@@ -1,0 +1,9 @@
+1794166558676;ARRANQUE;p2;no=n2;seq=0;ultimoTermo=0;termo=0;porto=7007
+1794166564754;CANDIDATO;p2;termo=1
+1794166564770;VOTO;p2;termo=1;candidato=n1;recusado
+1794166564826;NOVO_LIDER;p2;termo=1;lider=n1
+1794166564831;RECEBIDO;p2;termo=1;lider=n1;hb=1;ultimoSeq=0;n=0;seq=-
+1794166566825;RECEBIDO;p2;termo=1;lider=n1;hb=2;ultimoSeq=0;n=0;seq=-
+1794166568827;RECEBIDO;p2;termo=1;lider=n1;hb=3;ultimoSeq=0;n=0;seq=-
+1794166570832;RECEBIDO;p2;termo=1;lider=n1;hb=4;ultimoSeq=0;n=0;seq=-
+1794166572822;RECEBIDO;p2;termo=1;lider=n1;hb=5;ultimoSeq=0;n=0;seq=-

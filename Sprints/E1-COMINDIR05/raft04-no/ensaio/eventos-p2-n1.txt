@@ -1,0 +1,4 @@
+1794166558672;ARRANQUE;p2;no=n1;seq=0;ultimoTermo=0;termo=0;porto=7006
+1794166564754;CANDIDATO;p2;termo=1
+1794166564770;VOTO;p2;termo=1;candidato=n2;recusado
+1794166564806;LIDER;p2;termo=1;votos=[1, 3]

@@ -1,0 +1,118 @@
+=== RAFT CHECK ===
+Partições: 3 | pasta: C:\Users\renat\Desktop\escola\SDT\StD-2026-2027_Extra2\Sprints\E1-COMINDIR05\raft04-no\ensaio\.
+
+################ p0 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(2 votos) n2(1 voto) → líder n1 | eleição 62 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6095 ms (6,1 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas.txt)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n1)
+-- Coincidência final dos ficheiros --
+Menos de 2 ficheiros no-*: nada a comparar.
+
+################ p1 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(2 votos) n2(1 voto) → líder n1 | eleição 67 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6096 ms (6,1 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas.txt)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n1)
+-- Coincidência final dos ficheiros --
+Menos de 2 ficheiros no-*: nada a comparar.
+
+################ p2 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(2 votos) n3(1 voto) → líder n1 | eleição 65 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6127 ms (6,1 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas.txt)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n1)
+-- Coincidência final dos ficheiros --
+Menos de 2 ficheiros no-*: nada a comparar.
+
+################ Leituras perdidas ################
+Sem produtor.txt (ou vazio).
+
+################ Monitores ################
+Sem monitor-*.txt.
+
+=== RESUMO ===
+Termos com mais de um LIDER (tem de ser 0): 0
+Registos descartados (TRUNCADO): 0
+seq divergentes na coincidência final: 0
+=== FIM ===
+=== RAFT CHECK ===
+Partições: 3 | pasta: C:\Users\renat\Desktop\escola\SDT\StD-2026-2027_Extra2\Sprints\E1-COMINDIR05\raft04-no\ensaio\.
+
+################ p0 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(2 votos) n2(1 voto) → líder n1 | eleição 82 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6269 ms (6,3 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas.txt)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n1)
+-- Coincidência final dos ficheiros --
+Menos de 2 ficheiros no-*: nada a comparar.
+
+################ p1 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n2(3 votos) → líder n2 | eleição 46 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6151 ms (6,2 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas.txt)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n2)
+-- Coincidência final dos ficheiros --
+Menos de 2 ficheiros no-*: nada a comparar.
+
+################ p2 ################
+-- Termos (candidatos, votos, líder, duração da eleição) --
+termo 1: candidatos n1(3 votos) → líder n1 | eleição 81 ms
+-- Segurança --
+O termo de cada nó nunca diminui e o estado em disco acompanha-o.
+-- Primeiro líder --
+Primeiro líder 6162 ms (6,2 s) depois do arranque do primeiro nó.
+-- Indisponibilidade por falha (falhas.txt) --
+(sem falhas.txt)
+-- Registos truncados --
+Nenhum TRUNCADO.
+(líder do último termo: n1)
+-- Coincidência final dos ficheiros --
+Menos de 2 ficheiros no-*: nada a comparar.
+
+################ Leituras perdidas ################
+Sem produtor.txt (ou vazio).
+
+################ Monitores ################
+Sem monitor-*.txt.
+
+=== RESUMO ===
+Termos com mais de um LIDER (tem de ser 0): 0
+Registos descartados (TRUNCADO): 0
+seq divergentes na coincidência final: 0
+=== FIM ===
