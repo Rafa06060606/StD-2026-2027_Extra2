@@ -13,10 +13,18 @@ import net.dv8tion.jda.api.interactions.commands.OptionType;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.interactions.commands.build.SubcommandData;
 import net.dv8tion.jda.api.requests.GatewayIntent;
+import java.nio.file.Path;
+import java.io.IOException;
 
 import java.util.Set;
 
 public class LeaderBot extends ListenerAdapter {
+
+    private final RegistoManager registoManager;
+
+    public LeaderBot(RegistoManager registoManager) {
+        this.registoManager = registoManager;
+    }
 
     private static final String CANAL_ARQUIVO = "arquivo";
     private static final String PAPEL_ADMIN = "admin-arquivo";
@@ -25,61 +33,160 @@ public class LeaderBot extends ListenerAdapter {
     );
 
     public static void main(String[] args) throws InterruptedException {
-        // Lê o token e o Guild ID de variáveis de ambiente ou propriedades de sistema (-Dtpf.token=...)
+
+        // 1. Ler o token e o ID do servidor
         String token = System.getProperty("tpf.token", System.getenv("DISCORD_TOKEN"));
         String guildId = System.getProperty("tpf.guild", System.getenv("DISCORD_GUILD_ID"));
 
         if (token == null || token.isBlank()) {
-            System.err.println("ERRO: Token do Discord não definido. Define a variável de ambiente DISCORD_TOKEN ou -Dtpf.token=...");
+            System.err.println("ERRO: Token do Discord não definido.");
             System.exit(1);
+            return;
         }
+
         if (guildId == null || guildId.isBlank()) {
-            System.err.println("ERRO: ID do servidor (Guild ID) não definido. Define DISCORD_GUILD_ID ou -Dtpf.guild=...");
+            System.err.println("ERRO: ID do servidor não definido.");
             System.exit(1);
+            return;
         }
 
-        JDA jda = JDABuilder.createDefault(token)
-                .enableIntents(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT)
-                .addEventListeners(new LeaderBot())
-                .build()
-                .awaitReady();
+        try {
+            // 2. Validar os parâmetros -Dtpf.* e inicializar o armazenamento
+            Wire.validarConfiguracao();
+            Path pastaDados = Path.of("dados");
 
-        Guild guild = jda.getGuildById(guildId);
-        if (guild == null) {
-            System.err.println("ERRO: O bot não encontrou o servidor com ID " + guildId + ". Já adicionaste o bot ao servidor?");
+            byte[] masterKey = MasterKey.carregarOuCriar(
+                    pastaDados.resolve("master.key")
+            );
+
+            RegistoManager registoManager = new RegistoManager(
+                    pastaDados,
+                    masterKey
+            );
+
+            System.out.println("Armazenamento do líder inicializado com sucesso.");
+
+            // 3. Criar o bot com acesso ao RegistoManager
+            LeaderBot leaderBot = new LeaderBot(registoManager);
+
+            // 4. Iniciar a ligação ao Discord
+            JDA jda = JDABuilder.createDefault(token)
+                    .enableIntents(
+                            GatewayIntent.GUILD_MESSAGES,
+                            GatewayIntent.MESSAGE_CONTENT
+                    )
+                    .addEventListeners(leaderBot)
+                    .build()
+                    .awaitReady();
+
+            // 5. Obter o servidor Discord
+            Guild guild = jda.getGuildById(guildId);
+
+            if (guild == null) {
+                System.err.println(
+                        "ERRO: O bot não encontrou o servidor com ID " + guildId
+                );
+                jda.shutdown();
+                System.exit(1);
+                return;
+            }
+
+            // 6. Registar os comandos Slash
+            guild.updateCommands().addCommands(
+
+                    Commands.slash(
+                            "registar",
+                            "Regista uma entrada no arquivo distribuído"
+                    ).addOption(
+                            OptionType.STRING,
+                            "texto",
+                            "Texto a registar",
+                            true
+                    ),
+
+                    Commands.slash(
+                            "estado",
+                            "Mostra o estado das réplicas e chunks subreplicados"
+                    ),
+
+                    Commands.slash(
+                            "config",
+                            "Altera parâmetros de configuração do líder (Admin)"
+                    ).addSubcommands(
+                            new SubcommandData(
+                                    "r",
+                                    "Altera o fator de replicação R"
+                            ).addOption(
+                                    OptionType.STRING,
+                                    "n",
+                                    "Novo fator de replicação",
+                                    true
+                            )
+                    ),
+
+                    Commands.slash(
+                            "recuperar",
+                            "Recupera os registos num intervalo de LSN"
+                    ).addOption(
+                            OptionType.STRING,
+                            "de",
+                            "LSN inicial",
+                            true
+                    ).addOption(
+                            OptionType.STRING,
+                            "ate",
+                            "LSN final",
+                            true
+                    ),
+
+                    Commands.slash(
+                            "replica-token",
+                            "Gera um token de uso único para registar uma nova réplica (Admin)"
+                    ),
+
+                    Commands.slash(
+                            "replica-remover",
+                            "Remove uma réplica registada (Admin)"
+                    ).addOption(
+                            OptionType.STRING,
+                            "id",
+                            "Identificador da réplica",
+                            true
+                    ),
+
+                    Commands.slash(
+                            "rajada",
+                            "Injeta n registos sintéticos para ensaios (Admin)"
+                    ).addOption(
+                            OptionType.STRING,
+                            "n",
+                            "Número de registos a injetar",
+                            true
+                    ).addOption(
+                            OptionType.STRING,
+                            "intervaloms",
+                            "Intervalo em milissegundos",
+                            true
+                    )
+
+            ).queue(
+                    sucesso -> System.out.println(
+                            "LeaderBot online! " + sucesso.size()
+                                    + " comandos registados no servidor "
+                                    + guild.getName()
+                    ),
+                    erro -> System.err.println(
+                            "Falha ao registar comandos: " + erro.getMessage()
+                    )
+            );
+
+        } catch (Exception e) {
+            System.err.println("Erro ao iniciar o líder: " + e.getMessage());
+            e.printStackTrace();
             System.exit(1);
         }
-
-        // Registar os 7 slash commands diretamente no servidor de teste (atualização imediata)
-        guild.updateCommands().addCommands(
-                Commands.slash("registar", "Regista uma entrada no arquivo distribuído")
-                        .addOption(OptionType.STRING, "texto", "Texto a registar", true),
-
-                Commands.slash("estado", "Mostra o estado das réplicas e chunks subreplicados"),
-
-                Commands.slash("config", "Altera parâmetros de configuração do líder (Admin)")
-                        .addSubcommands(
-                                new SubcommandData("r", "Altera o fator de replicação R")
-                                        .addOption(OptionType.STRING, "n", "Novo fator de replicação (inteiro >= 1)", true)
-                        ),
-
-                Commands.slash("recuperar", "Recupera os registos num intervalo de LSN")
-                        .addOption(OptionType.STRING, "de", "LSN inicial (>= 1)", true)
-                        .addOption(OptionType.STRING, "ate", "LSN final (>= de)", true),
-
-                Commands.slash("replica-token", "Gera um token de uso único para registar uma nova réplica (Admin)"),
-
-                Commands.slash("replica-remover", "Remove uma réplica registada (Admin)")
-                        .addOption(OptionType.STRING, "id", "Identificador da réplica (ex.: A)", true),
-
-                Commands.slash("rajada", "Injeta n registos sintéticos para ensaios (Admin)")
-                        .addOption(OptionType.STRING, "n", "Número de registos a injetar (> 0)", true)
-                        .addOption(OptionType.STRING, "intervaloms", "Intervalo em milissegundos entre registos (>= 0)", true)
-        ).queue(
-                sucesso -> System.out.println("LeaderBot online! " + sucesso.size() + " comandos registados no servidor " + guild.getName()),
-                erro -> System.err.println("Falha ao registar comandos: " + erro.getMessage())
-        );
     }
+
 
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {
@@ -95,14 +202,45 @@ public class LeaderBot extends ListenerAdapter {
 
         // 2. Identificar comando, ler e validar argumentos
         switch (cmd) {
+            
             case "registar" -> {
                 String texto = getStringArg(event, "texto");
+
                 if (texto.isBlank()) {
-                    event.reply("Erro: o argumento `texto` não pode estar vazio.").setEphemeral(true).queue();
+                    event.reply("Erro: o texto não pode estar vazio.")
+                            .setEphemeral(true)
+                            .queue();
                     return;
                 }
-                event.reply("`/registar` recebido: texto=\"" + texto + "\" — ainda não implementado").queue();
+
+                try {
+                    // Obter os dados de quem executou o comando
+                    String autor = event.getUser().getName();
+                    String canal = event.getChannel().getName();
+
+                    // Registar através do método central do RegistoManager
+                    Registo registo = registoManager.registar(
+                            autor,
+                            canal,
+                            texto
+                    );
+
+                    // Só responder depois de o registo estar persistido
+                    event.reply(
+                            "Registo guardado com sucesso!\n" +
+                            "LSN atribuído: **" + registo.lsn() + "**"
+                    ).queue();
+
+                } catch (Exception e) {
+                    System.err.println("Erro ao registar mensagem: " + e.getMessage());
+                    e.printStackTrace();
+
+                    event.reply("Não foi possível guardar o registo. Tenta novamente.")
+                            .setEphemeral(true)
+                            .queue();
+                }
             }
+
 
             case "estado" -> {
                 event.reply("`/estado` recebido — ainda não implementado").queue();
@@ -163,33 +301,103 @@ public class LeaderBot extends ListenerAdapter {
                     event.reply("Erro em `/rajada`: argumentos inválidos (n=\"" + nStr + "\", intervaloMs=\"" + intStr + "\"). `n` deve ser >= 1 e `intervaloMs` >= 0.").setEphemeral(true).queue();
                     return;
                 }
-                event.reply("`/rajada` recebido: n=" + n + ", intervaloMs=" + intervaloMs + " — ainda não implementado").queue();
+                // A rajada pode demorar (cada registo faz fsync). Confirmamos já a interação ao Discord
+                // e executamos o trabalho noutra thread para não bloquear a thread de eventos do JDA.
+                event.deferReply().queue();
+                final int total = n;
+                final long espera = intervaloMs;
+                final String autor = event.getUser().getName();
+                final String canal = event.getChannel().getName();
+
+                Thread rajada = new Thread(() -> executarRajada(event, total, espera, autor, canal), "rajada");
+                rajada.setDaemon(true);
+                rajada.start();
             }
 
             default -> event.reply("Comando desconhecido.").setEphemeral(true).queue();
         }
     }
 
+    
+    /** Tamanho do texto sintético: suficiente para que 500 registos excedam vários chunks de 64 KB. */
+    private static final int TAMANHO_TEXTO_RAJADA = 400;
+
+    /**
+     * Injeta n registos sintéticos pelo MESMO método usado por /registar (RegistoManager.registar),
+     * para testar o caminho real de escrita, e não um caminho alternativo.
+     */
+    private void executarRajada(SlashCommandInteractionEvent event, int n, long intervaloMs,
+                                String autor, String canal) {
+        int registados = 0;
+        long primeiroLsn = -1;
+        long ultimoLsn = -1;
+        try {
+            for (int i = 1; i <= n; i++) {
+                Registo r = registoManager.registar(autor, canal, textoSintetico(i, n));
+                if (primeiroLsn < 0) primeiroLsn = r.lsn();
+                ultimoLsn = r.lsn();
+                registados++;
+                if (intervaloMs > 0 && i < n) Thread.sleep(intervaloMs);
+            }
+            event.getHook().sendMessage(
+                    "Rajada concluída: **" + registados + "** registos (LSN " + primeiroLsn + " a " + ultimoLsn + ")."
+            ).queue();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            event.getHook().sendMessage("Rajada interrompida após " + registados + " registos.").queue();
+        } catch (Exception e) {
+            System.err.println("Erro na rajada: " + e.getMessage());
+            e.printStackTrace();
+            event.getHook().sendMessage(
+                    "A rajada falhou após " + registados + " de " + n + " registos. Os registos já confirmados mantêm-se guardados."
+            ).queue();
+        }
+    }
+
+    /** Gera um texto previsível de TAMANHO_TEXTO_RAJADA caracteres, útil para reconhecer registos nos testes. */
+    private static String textoSintetico(int i, int n) {
+        StringBuilder sb = new StringBuilder("RAJADA_" + i + "_DE_" + n + "_");
+        while (sb.length() < TAMANHO_TEXTO_RAJADA) sb.append('X');
+        return sb.toString();
+    }
+
     @Override
     public void onMessageReceived(MessageReceivedEvent event) {
-        // Ignorar mensagens enviadas por bots (incluindo o próprio LeaderBot)
+
+        // Ignorar mensagens de bots
         if (event.getAuthor().isBot()) {
             return;
         }
 
-        // Ignorar mensagens que não sejam no canal #arquivo
-        if (!CANAL_ARQUIVO.equals(event.getChannel().getName())) {
+        // Ignorar mensagens fora do canal #arquivo
+        if (!event.getChannel().getName().equals(CANAL_ARQUIVO)) {
             return;
         }
 
+        // Obter os dados da mensagem
         String autor = event.getAuthor().getName();
-        String conteudo = event.getMessage().getContentRaw();
+        String canal = event.getChannel().getName();
+        String texto = event.getMessage().getContentRaw();
 
-        System.out.println("[#arquivo] Mensagem detetada de " + autor + ": " + conteudo);
-        event.getChannel().sendMessage(
-                "Mensagem em `#arquivo` recebida de **" + autor + "**: \"" + conteudo + "\" — registo ainda não implementado"
-        ).queue();
+        // Ignorar mensagens vazias
+        if (texto.isBlank()) {
+            return;
+        }
+
+        try {
+            Registo registo = registoManager.registar(autor, canal, texto);
+
+            System.out.println(
+                "Mensagem registada com sucesso. LSN: " + registo.lsn()
+            );
+
+        } catch (Exception e) {
+            System.err.println("Erro ao registar mensagem do Discord: "
+                    + e.getMessage());
+            e.printStackTrace();
+        }
     }
+
 
     private boolean temPapelAdmin(Member member) {
         if (member == null) return false;
