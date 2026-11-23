@@ -93,7 +93,7 @@ public class PartitionReplica {
                         aplicar(r, false);
                         // regra da COMINDIR02: demasiados retidos → recupera o intervalo em falta
                         if (buffered.size() > Wire.LIMITE_RETIDOS) {
-                            recoverRange(seq + 1, buffered.firstKey() - 1);
+                            recoverRange(seq + 1, buffered.firstKey() - 1);//
                         }
                     }
 
@@ -142,7 +142,7 @@ public class PartitionReplica {
         }
     }
 
-    // pede ao líder, por TCP, os registos com from <= seq <= to
+    //  quem pede ao líder, por TCP, os registos com from <= seq <= to 
     private void recoverRange(long from, long to) {
         String host;
         int port;

@@ -64,7 +64,7 @@ public class PartitionLeader {
 
         IpfsPubSub pubsub = new IpfsPubSub(api);
 
-        // servidor TCP de recuperação (inalterado)
+        // servidor TCP de recuperação (inalterado) quem atende
         new Thread(this::startTcpServer).start();
 
         // heartbeat + lote: no arranque e depois a cada PERIODO_HB_MS
@@ -176,7 +176,7 @@ public class PartitionLeader {
             System.out.println("Erro no servidor TCP p" + k + ": " + e.getMessage());
         }
     }
-
+// quem recebe o pedido de recuperação (pedidos de outros líderes ou de clientes)
     private void handleRecovery(Socket socket) {
         try (Socket s = socket;
              BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));

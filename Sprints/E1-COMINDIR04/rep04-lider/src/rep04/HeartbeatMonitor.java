@@ -1,3 +1,4 @@
+//Deteta ausência de heartbeats e atualiza o estado do líder. 
 package rep04;
 
 import java.util.function.Consumer;
