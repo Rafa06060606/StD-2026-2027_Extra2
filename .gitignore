@@ -1,1 +1,24 @@
-.clawdea/REPO_STATE.md
+# Segredos e chaves (TPF)
+master.key
+.env
+*.token
+token.txt
+
+# Ficheiros de estado e logs do TPF
+registos.log
+catalogo.txt
+desafios.txt
+replicas.txt
+eventos-*.txt
+selados/
+dados-*/
+falhas.txt
+
+# Build Java / Maven / IDEs
+target/
+*.class
+*.jar
+.idea/
+*.iml
+.vscode/
+.DS_Store
